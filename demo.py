@@ -39,18 +39,28 @@ HF_PATHS = [
 
 
 def start_bpy_server():
-    proc = subprocess.Popen(
-        [sys.executable, "bpy_server.py"],
+    popen_kwargs = dict(
+        args=[sys.executable, "bpy_server.py"],
         stdout=None,
         stderr=None,
-        preexec_fn=os.setsid,
     )
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_kwargs["preexec_fn"] = os.setsid
+
+    proc = subprocess.Popen(**popen_kwargs)
     print(f"[Main] bpy_server.py started (pid={proc.pid})")
 
     def cleanup():
         print(f"[Main] Terminating bpy_server.py (pid={proc.pid})")
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            if proc.poll() is not None:
+                return
+            if os.name == "nt":
+                proc.terminate()
+            else:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
         except ProcessLookupError:
             pass
 
@@ -106,6 +116,30 @@ def map_output_path(
 ) -> Path:
     rel = in_path.relative_to(input_root)
     return (output_root / rel).with_suffix(".glb")
+
+
+def post_bpy_payload(endpoint: str, payload):
+    payload_path = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix=f"skintokens_{endpoint}_", suffix=".pt", delete=False) as f:
+            f.write(object_to_bytes(payload))
+            payload_path = f.name
+        request_payload = {"payload_path": payload_path}
+        response = requests.post(
+            f"{BPY_SERVER}/{endpoint}",
+            data=object_to_bytes(request_payload),
+        )
+        response.raise_for_status()
+        result = bytes_to_object(response.content)
+        if isinstance(result, dict) and result.get("error") is not None:
+            raise RuntimeError(result.get("traceback") or result["error"])
+        return result
+    finally:
+        if payload_path is not None:
+            try:
+                os.remove(payload_path)
+            except OSError:
+                pass
 
 
 def run_rig(
@@ -211,24 +245,14 @@ def run_rig(
                 export_path=str(out_path),
                 group_per_vertex=4,
             )
-            res = bytes_to_object(
-                requests.post(
-                    f"{BPY_SERVER}/transfer",
-                    data=object_to_bytes(payload),
-                ).content
-            )
+            res = post_bpy_payload("transfer", payload)
         else:
             payload = dict(
                 asset=asset,
                 filepath=str(out_path),
                 group_per_vertex=4,
             )
-            res = bytes_to_object(
-                requests.post(
-                    f"{BPY_SERVER}/export",
-                    data=object_to_bytes(payload),
-                ).content
-            )
+            res = post_bpy_payload("export", payload)
 
         if res != "ok":
             print(f"[Error] {res}")

@@ -1,12 +1,28 @@
 from bottle import request, response
 
 import bottle
+import os
 import queue
 import threading
+import traceback
 
 from .spec import bytes_to_object, object_to_bytes, BPY_PORT
 
 from ..rig_package.parser.bpy import BpyParser, transfer_rigging
+
+
+def _resolve_payload(data):
+    if isinstance(data, dict) and "payload_path" in data:
+        payload_path = data["payload_path"]
+        try:
+            with open(payload_path, "rb") as f:
+                return bytes_to_object(f.read())
+        finally:
+            try:
+                os.remove(payload_path)
+            except OSError:
+                pass
+    return data
 
 def run():
     path_queue = queue.Queue()
@@ -51,18 +67,26 @@ def run():
     while True:
         d = path_queue.get()
         op = d[0]
-        data = bytes_to_object(d[1])
-        if op == 'load':
-            print("[SERVER] received load path:", data)
-            asset = BpyParser.load(data)
-            result_queue.put(asset)
-        elif op == 'export':
-            print("[SERVER] received export path:", data['filepath'])
-            BpyParser.export(**data)
-            result_queue.put('ok')
-        elif op == 'transfer':
-            print("[SERVER] received transfer path:", data['target_path'])
-            transfer_rigging(**data)
-            result_queue.put('ok')
-        else:
-            result_queue.put(f"unsupported op: {str(op)}")
+        try:
+            data = _resolve_payload(bytes_to_object(d[1]))
+            if op == 'load':
+                print("[SERVER] received load path:", data)
+                asset = BpyParser.load(data)
+                result_queue.put(asset)
+            elif op == 'export':
+                print("[SERVER] received export path:", data['filepath'])
+                BpyParser.export(**data)
+                result_queue.put('ok')
+            elif op == 'transfer':
+                print("[SERVER] received transfer path:", data['target_path'])
+                transfer_rigging(**data)
+                result_queue.put('ok')
+            else:
+                result_queue.put(f"unsupported op: {str(op)}")
+        except Exception as e:
+            tb = traceback.format_exc()
+            print(tb)
+            result_queue.put({
+                "error": f"{type(e).__name__}: {e}",
+                "traceback": tb,
+            })
