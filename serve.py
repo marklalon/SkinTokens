@@ -283,16 +283,36 @@ def _wait_for_bpy_server(timeout: float = 30):
 
 
 def _load_pipeline():
-    """Load the model pipeline and start the bpy_server."""
+    """Load the model pipeline and start the bpy_server.
+
+    The bpy_server and the model are loaded in parallel.  The bpy_server
+    is started first (fast subprocess fork), but we do not wait for it to
+    become healthy until after the model has also been loaded.  This
+    overlaps the ~4 s Blender startup with the ~10 s model load.
+    """
     from src.data.transform import Transform
     from src.tokenizer.parse import get_tokenizer
     from src.server.spec import get_model
 
-    # 1. Start bpy_server
+    # 1. Start bpy_server subprocess (fast — just a fork)
     state.bpy_proc = _run_startup_stage("starting bpy_server", _start_bpy_server)
-    _run_startup_stage("waiting for bpy_server", _wait_for_bpy_server)
 
-    # 2. Load model
+    # 2. Kick off bpy_server readiness check in a background thread so it
+    #    runs concurrently with model loading.
+    bpy_error: list[Exception | None] = [None]
+
+    def _wait_for_bpy_bg():
+        try:
+            _wait_for_bpy_server()
+        except Exception as exc:
+            bpy_error[0] = exc
+        finally:
+            pass  # thread exits, join() handles synchronization
+
+    bpy_thread = threading.Thread(target=_wait_for_bpy_bg, daemon=True)
+    bpy_thread.start()
+
+    # 3. Load model (this dominates startup time)
     def load_model_fn():
         model = get_model(MODEL_CKPT, hf_path=HF_PATH, device=DEVICE)
         tokenizer = get_tokenizer(**model.tokenizer_config)
@@ -302,6 +322,12 @@ def _load_pipeline():
     model, tokenizer, transform = _run_startup_stage(
         f"loading model from {MODEL_CKPT}", load_model_fn
     )
+
+    # 4. Wait for bpy_server readiness (should already be done by now)
+    bpy_thread.join()
+    if bpy_error[0] is not None:
+        raise bpy_error[0]
+
     state.model = model
     state.tokenizer = tokenizer
     state.transform = transform

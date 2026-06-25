@@ -16,7 +16,7 @@ services:
       SKINTOKENS_DATA_ROOT: /workspace/SkinTokens
       SKINTOKENS_DEVICE: cuda
       SKINTOKENS_HOST: 0.0.0.0
-      SKINTOKENS_PORT: 8087
+      SKINTOKENS_PORT: 8000
       HF_HOME: /cache/huggingface
       TORCH_HOME: /cache/torch
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
@@ -28,11 +28,11 @@ services:
       - torch_cache:/cache/torch
     working_dir: /workspace/SkinTokens
     ports:
-      - "${SKINTOKENS_HOST_PORT:-8087}:8087"
+      - "8087:8000"
     shm_size: 8gb
     command: ["python", "serve.py"]
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8087/health"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
       interval: 30s
       timeout: 5s
       retries: 5

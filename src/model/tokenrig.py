@@ -112,7 +112,13 @@ class TokenRig(ModelSpec):
         llm_config.dtype = torch.bfloat16
         llm_config.pre_norm = True
         self.llm_config = llm_config
-        self.transformer = AutoModelForCausalLM.from_config(config=llm_config, attn_implementation="flash_attention_2").to(torch.bfloat16)
+        # Build directly on GPU in bfloat16: ~600M params never touch CPU
+        # memory, avoiding both the float32→bfloat16 conversion and the
+        # later model.to(device) transfer.
+        with torch.device("cuda"):
+            self.transformer = AutoModelForCausalLM.from_config(
+                config=llm_config, attn_implementation="flash_attention_2"
+            )
         
         self.output_proj = nn.Sequential(
             nn.Linear(self.mesh_encoder.width, self.hidden_size),
