@@ -80,7 +80,7 @@ class SkinFSQCVAEModel(ModelMixin, ConfigMixin):
         )
 
         self.decoder = Tripo2Decoder(
-            in_channels=self.embedder.out_dim + self.cond_channels,
+            in_channels=self.embedder.out_dim + self.config.cond_channels,
             out_channels=self.out_channels,
             dim=width_decoder,
             num_attention_heads=num_attention_heads,

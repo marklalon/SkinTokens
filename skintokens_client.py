@@ -1,0 +1,173 @@
+"""SkinTokens / TokenRig WebSocket client — stream progress and save a rigged GLB.
+
+Example:
+    python skintokens_client.py --file assets/character.obj --output out.glb
+    python skintokens_client.py --file model.fbx --server http://HOST:8087 \
+        --use-skeleton --use-postprocess
+
+Requires the ``websockets`` package.
+"""
+import argparse
+import asyncio
+import base64
+import json
+import os
+import sys
+import time
+from contextlib import suppress
+
+
+def _websocket_url(server: str) -> str:
+    base = server.rstrip("/")
+    if base.startswith("https://"):
+        base = "wss://" + base[len("https://"):]
+    elif base.startswith("http://"):
+        base = "ws://" + base[len("http://"):]
+    elif not base.startswith(("ws://", "wss://")):
+        base = "ws://" + base
+    return base + "/ws/generate"
+
+
+class ProgressDisplay:
+    """Render progress in place on a terminal, or as lines when redirected."""
+
+    def __init__(self, width: int = 30):
+        self.width = width
+        self.last_length = 0
+        self.active = False
+
+    def update(self, percent: int, step: str, elapsed: float | None = None) -> None:
+        percent = max(0, min(100, int(percent)))
+        filled = round(self.width * percent / 100)
+        bar = "#" * filled + "-" * (self.width - filled)
+        elapsed_text = f"  {elapsed:.1f}s" if elapsed is not None else ""
+        line = f"[client] [{bar}] {percent:3d}%  {step}{elapsed_text}"
+
+        if sys.stdout.isatty():
+            sys.stdout.write("\r" + line.ljust(self.last_length))
+            sys.stdout.flush()
+            self.last_length = max(self.last_length, len(line))
+            self.active = True
+        else:
+            print(line)
+
+    def finish(self) -> None:
+        if self.active:
+            print()
+            self.active = False
+
+
+async def _run(args) -> None:
+    try:
+        import websockets
+    except ImportError as exc:
+        raise RuntimeError(
+            "missing dependency 'websockets'; install it with: pip install websockets"
+        ) from exc
+
+    ws_url = _websocket_url(args.server)
+    with open(args.file, "rb") as f:
+        file_b64 = base64.b64encode(f.read()).decode("ascii")
+
+    filename = os.path.basename(args.file)
+
+    payload = {
+        "file_base64": file_b64,
+        "filename": filename,
+        "top_k": args.top_k,
+        "top_p": args.top_p,
+        "temperature": args.temperature,
+        "repetition_penalty": args.repetition_penalty,
+        "num_beams": args.num_beams,
+        "use_skeleton": args.use_skeleton,
+        "use_transfer": args.use_transfer,
+        "use_postprocess": args.use_postprocess,
+    }
+
+    progress = ProgressDisplay()
+    started_at = time.monotonic()
+    print(f"[client] connecting {ws_url}")
+    try:
+        async with websockets.connect(
+            ws_url,
+            max_size=64 * 1024 * 1024,
+            open_timeout=args.timeout,
+        ) as ws:
+            await ws.send(json.dumps(payload))
+
+            try:
+                async for raw_message in ws:
+                    message = json.loads(raw_message)
+                    stage = message.get("stage", "unknown")
+
+                    if stage == "queued":
+                        if message.get("queued"):
+                            print("[client] queued; waiting for the GPU")
+                        else:
+                            print("[client] GPU is available; starting generation")
+                    elif stage == "processing":
+                        progress.update(
+                            message.get("progress", 0),
+                            message.get("step", "processing"),
+                            message.get("elapsed_sec"),
+                        )
+                    elif stage == "done":
+                        progress.update(100, "complete", message.get("elapsed_sec"))
+                        progress.finish()
+                        glb = base64.b64decode(message["glb_base64"])
+                        output_dir = os.path.dirname(os.path.abspath(args.output))
+                        os.makedirs(output_dir, exist_ok=True)
+                        with open(args.output, "wb") as f:
+                            f.write(glb)
+                        print(f"[client] saved {len(glb)} bytes -> {args.output}")
+                        return
+                    elif stage == "cancelled":
+                        raise asyncio.CancelledError(message.get("message"))
+                    elif stage == "error":
+                        raise RuntimeError(message.get("message", "unknown server error"))
+                    else:
+                        print(f"[client] server stage: {stage}")
+            except asyncio.CancelledError:
+                with suppress(Exception):
+                    await asyncio.shield(ws.send(json.dumps({"type": "cancel"})))
+                raise
+
+            raise RuntimeError("WebSocket closed before the result was received")
+    finally:
+        progress.finish()
+        print(f"[client] request elapsed: {time.monotonic() - started_at:.2f}s")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="SkinTokens / TokenRig WebSocket client with live progress"
+    )
+    parser.add_argument("--file", required=True, help="Input 3D file path (OBJ/FBX/GLB)")
+    parser.add_argument("--output", default="outputs/output.glb", help="Output GLB path")
+    parser.add_argument("--server", default="http://localhost:8087", help="Server base URL")
+
+    parser.add_argument("--top-k", type=int, default=5, help="Top-k sampling (default: 5)")
+    parser.add_argument("--top-p", type=float, default=0.95, help="Top-p sampling (default: 0.95)")
+    parser.add_argument("--temperature", type=float, default=1.0, help="Temperature (default: 1.0)")
+    parser.add_argument("--repetition-penalty", type=float, default=2.0, help="Repetition penalty (default: 2.0)")
+    parser.add_argument("--num-beams", type=int, default=10, help="Number of beams (default: 10)")
+
+    parser.add_argument("--use-skeleton", action="store_true", help="Use skeleton for skin generation")
+    parser.add_argument("--use-transfer", action="store_true", help="Use transfer to maintain texture")
+    parser.add_argument("--use-postprocess", action="store_true", help="Use postprocess (voxel skin)")
+
+    parser.add_argument("--timeout", type=int, default=30, help="Connection timeout seconds")
+    args = parser.parse_args()
+
+    try:
+        asyncio.run(_run(args))
+    except KeyboardInterrupt:
+        print("\n[client] cancelled", file=sys.stderr)
+        raise SystemExit(130)
+    except Exception as exc:
+        print(f"[client] error: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()

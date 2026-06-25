@@ -17,11 +17,15 @@ from .skin_vae.autoencoders import SkinFSQCVAEModel
 
 try:
     from flash_attn_interface import flash_attn_func # type: ignore
-except Exception as e:
-    from flash_attn.flash_attn_interface import flash_attn_func as _flash_attn_func
-    def flash_attn_func(*args, **kwargs):
-        res = _flash_attn_func(*args, **kwargs)
-        return res, None
+except Exception:
+    try:
+        from flash_attn.flash_attn_interface import flash_attn_func as _flash_attn_func
+        def flash_attn_func(*args, **kwargs):
+            res = _flash_attn_func(*args, **kwargs)
+            return res, None
+    except Exception:
+        def flash_attn_func(q, k, v, *args, **kwargs):
+            return torch.nn.functional.scaled_dot_product_attention(q, k, v), None
 
 class Perceiver(nn.Module):
     def __init__(self, channels, out_tokens, num_heads=8):

@@ -2,6 +2,8 @@ from huggingface_hub import hf_hub_download, snapshot_download
 
 import argparse
 
+from src.paths import DATA_ROOT, MODEL_ROOT
+
 REPO_ID = "VAST-AI/SkinTokens"
 
 MODELS = [
@@ -15,14 +17,14 @@ DATASETS = [
 ]
 
 LLM_REPO = "Qwen/Qwen3-0.6B"
-LLM_LOCAL_DIR = "models/Qwen3-0.6B"
+LLM_LOCAL_DIR = MODEL_ROOT / "models/Qwen3-0.6B"
 
 
 def download_model(name: str):
     local_path = hf_hub_download(
         repo_id=REPO_ID,
         filename=name,
-        local_dir=".",
+        local_dir=MODEL_ROOT,
     )
     print(f"[MODEL] {name} downloaded to: {local_path}")
 
@@ -30,7 +32,7 @@ def download_model(name: str):
 def download_llm():
     local_path = snapshot_download(
         repo_id=LLM_REPO,
-        local_dir=LLM_LOCAL_DIR,
+        local_dir=str(LLM_LOCAL_DIR),
         ignore_patterns=["*.bin", "*.safetensors"],
     )
     print(f"[LLM] Config downloaded to: {local_path}")
@@ -40,13 +42,13 @@ def download_data(name: str):
     local_path = hf_hub_download(
         repo_id=REPO_ID,
         filename=f"dataset_clean/{name}",
-        local_dir=".",
+        local_dir=DATA_ROOT,
     )
     name = name.removesuffix(".zip")
     local_path = snapshot_download(
         repo_id=REPO_ID,
         allow_patterns=[f"datalist/{name}/*"],
-        local_dir=".",
+        local_dir=DATA_ROOT,
     )
     print(f"[DATA] {name} downloaded to: {local_path}")
 

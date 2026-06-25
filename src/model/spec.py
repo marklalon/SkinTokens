@@ -11,6 +11,7 @@ import lightning.pytorch as pl
 import torch
 
 from ..data.transform import Transform 
+from ..paths import resolve_model_path
 from ..rig_package.info.asset import Asset
 from ..tokenizer.spec import DetokenizeOutput
 
@@ -81,6 +82,7 @@ class ModelSpec(pl.LightningModule, ABC):
     
     @classmethod
     def load_from_system_checkpoint(cls, checkpoint_path: str, strict: bool=True, **kwargs):
+        checkpoint_path = str(resolve_model_path(checkpoint_path))
         ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         state_dict = ckpt['state_dict']
         model_config = kwargs.get('model_config', None)

@@ -119,6 +119,50 @@ python demo.py --input examples/giraffe_skeleton.glb --output results/giraffe.gl
 python demo.py --input examples/ --output results/ --use_transfer
 ```
 
+### Docker (NVIDIA GPU)
+
+The Compose setup follows the same external-model-volume pattern as TRELLIS.2.
+Project source is mounted at `/workspace/SkinTokens`, while checkpoints are read
+from the external `models` volume at `/models/SkinTokens/experiments`.
+
+```powershell
+# Copy local experiments/ checkpoints into the shared Docker volume (once)
+.\scripts\copy_weights_to_volume.ps1
+
+# Build and start the Gradio service
+docker compose build
+docker compose up -d
+```
+
+If that CUDA base is already available under another local image tag, it can be
+reused without changing the resulting isolated Python environment:
+
+```powershell
+$env:SKINTOKENS_BASE_IMAGE = "trellis2:base"
+docker compose build
+```
+
+Open `http://127.0.0.1:1024`. To run command-line inference inside the same
+environment:
+
+```powershell
+docker compose run --rm skintokens python demo.py `
+  --input examples/giraffe.glb --output results/giraffe.glb
+```
+
+Paths can be overridden with `SKINTOKENS_MODEL_ROOT`,
+`SKINTOKENS_EXPERIMENTS_DIR`, and `SKINTOKENS_DATA_ROOT`. This also makes saved
+checkpoint references such as `experiments/...` portable between host training
+and containers.
+
+> [!NOTE]
+> This public repository currently contains no training launcher or training
+> configuration, and both published model classes leave `training_step()`
+> unimplemented. The image includes Lightning and mounts the project read-write,
+> so upstream/private training code can be run with
+> `docker compose run --rm skintokens python <training-entrypoint>`, but the
+> released source itself cannot start model training as-is.
+
 ### Generation Parameters
 
 | Parameter | Default | Description |

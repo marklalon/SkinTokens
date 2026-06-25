@@ -9,13 +9,11 @@ import time
 from pathlib import Path
 from typing import List, Iterable, Optional, Tuple
 
-import gradio as gr
 import requests
 from torch import Tensor
 from tqdm import tqdm
 
 os.environ["XFORMERS_IGNORE_FLASH_VERSION_CHECK"] = "1"
-gr.TEMP_DIR = "tmp_gradio"
 
 from src.data.dataset import DatasetConfig, RigDatasetModule
 from src.data.transform import Transform
@@ -28,9 +26,10 @@ from src.server.spec import (
     bytes_to_object,
 )
 from src.data.vertex_group import voxel_skin
+from src.paths import EXPERIMENTS_DIR
 
 MODEL_CKPTS = [
-    "experiments/articulation_xl_quantization_256_token_4/grpo_1400.ckpt",
+    str(EXPERIMENTS_DIR / "articulation_xl_quantization_256_token_4/grpo_1400.ckpt"),
 ]
 
 HF_PATHS = [
@@ -75,7 +74,7 @@ CURRENT_MODEL_CKPT: Optional[str] = None
 CURRENT_HF_PATH: Optional[str] = None
 
 
-def load_model(model_ckpt: str, hf_path: Optional[str]) -> Tuple[str, str]:
+def load_model(model_ckpt: str, hf_path: Optional[str], device: Optional[str] = None) -> Tuple[str, str]:
     global model, tokenizer, transform, CURRENT_MODEL_CKPT, CURRENT_HF_PATH
     if hf_path == "None":
         hf_path = None
@@ -86,7 +85,7 @@ def load_model(model_ckpt: str, hf_path: Optional[str]) -> Tuple[str, str]:
         raise RuntimeError("model_ckpt is empty. Please select a checkpoint.")
 
     print(f"Loading model: {model_ckpt}, hf_path={hf_path}")
-    model = get_model(model_ckpt, hf_path=hf_path)
+    model = get_model(model_ckpt, hf_path=hf_path, device=device)
     assert model.tokenizer_config is not None
     tokenizer = get_tokenizer(**model.tokenizer_config)
     transform = Transform.parse(**model.transform_config["predict_transform"])
@@ -188,7 +187,7 @@ def run_rig(
 
     for i, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
         batch = {
-            k: v.to("cuda") if isinstance(v, Tensor) else v
+            k: v.to(model.device) if isinstance(v, Tensor) else v
             for k, v in batch.items()
         }
 
@@ -296,118 +295,6 @@ def run_cli(args):
     )
 
 
-TOT = 0
-def run_gradio(
-    files,
-    top_k,
-    top_p,
-    temperature,
-    repetition_penalty,
-    num_beams,
-    use_skeleton,
-    use_transfer,
-    use_postprocess,
-    model_ckpt,
-    hf_path,
-):
-    if not files:
-        return "Please upload at least one 3D model.", None
-
-    tmp_out = Path(tempfile.mkdtemp(prefix="tokenrig_"))
-    filepaths = [Path(f.name) for f in files]
-    global TOT
-    outputs = []
-    for filepath in filepaths:
-        TOT += 1
-        outputs.append(tmp_out / f"res_{TOT}.glb")
-
-    run_rig(
-        filepaths,
-        top_k,
-        top_p,
-        temperature,
-        repetition_penalty,
-        num_beams,
-        use_skeleton,
-        use_transfer,
-        use_postprocess,
-        outputs,
-        model_ckpt,
-        hf_path,
-    )
-
-    return f"Processed {len(outputs)} models.", [str(p) for p in outputs]
-
-
-def launch_gradio():
-    model_ckpts = MODEL_CKPTS
-    hf_paths = HF_PATHS
-    default_ckpt = model_ckpts[0] if model_ckpts else ""
-    default_hf = hf_paths[0] if hf_paths else "None"
-
-    with gr.Blocks(title="TokenRig Demo") as demo:
-        gr.Markdown("## TokenRig Demo")
-        gr.Markdown("Upload 3D assets, configure parameters, generate rigged GLB")
-
-        files = gr.File(
-            label="3D Models",
-            file_count="multiple",
-            file_types=[".obj", ".fbx", ".glb"],
-        )
-
-        with gr.Accordion("Generation Parameters", open=True):
-            model_ckpt = gr.Dropdown(
-                choices=model_ckpts,
-                value=default_ckpt,
-                label="Model checkpoint",
-                interactive=True,
-            )
-            hf_path = gr.Dropdown(
-                choices=hf_paths,
-                value=default_hf,
-                label="HF path",
-                interactive=True,
-            )
-            top_k = gr.Slider(1, 200, value=5, step=1, label="top_k")
-            top_p = gr.Slider(0.1, 1.0, value=0.95, step=0.01, label="top_p")
-            temperature = gr.Slider(0.1, 2.0, value=1.0, step=0.1, label="temperature")
-            repetition_penalty = gr.Slider(0.5, 3.0, value=2.0, step=0.1, label="repetition_penalty")
-            num_beams = gr.Slider(1, 20, value=10, step=1, label="num_beams")
-            use_skeleton = gr.Checkbox(False, label="Use skeleton (only generate skin if skeleton exists)")
-            use_transfer = gr.Checkbox(False, label="Use transfer (maintain texture)")
-            use_postprocess = gr.Checkbox(False, label="Use postprocess (voxel skin)")
-
-        run_btn = gr.Button("Run", variant="primary")
-        load_btn = gr.Button("Load Model")
-        log = gr.Textbox(label="Status")
-        output = gr.File(label="Generated GLB", interactive=False)
-
-        load_btn.click(
-            lambda ckpt, hf: load_model(ckpt, hf)[0],
-            inputs=[model_ckpt, hf_path],
-            outputs=[log],
-        )
-
-        run_btn.click(
-            run_gradio,
-            inputs=[
-                files,
-                top_k,
-                top_p,
-                temperature,
-                repetition_penalty,
-                num_beams,
-                use_skeleton,
-                use_transfer,
-                use_postprocess,
-                model_ckpt,
-                hf_path,
-            ],
-            outputs=[log, output],
-        )
-
-    demo.launch(server_port=1024)
-
 def wait_for_bpy_server(timeout=30):
     t0 = time.time()
     while True:
@@ -438,14 +325,12 @@ if __name__ == "__main__":
     parser.add_argument("--model_ckpt", default=MODEL_CKPTS[0] if MODEL_CKPTS else "")
     parser.add_argument("--hf_path", default=None)
 
-    parser.add_argument("--gradio", action="store_true")
-
     args = parser.parse_args()
+
+    if not args.input:
+        parser.error("--input is required for CLI mode. Use serve.py for the HTTP API server.")
 
     server_proc = start_bpy_server()
     wait_for_bpy_server()
 
-    if args.gradio or not args.input:
-        launch_gradio()
-    else:
-        run_cli(args)
+    run_cli(args)

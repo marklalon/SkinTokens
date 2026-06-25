@@ -1,5 +1,4 @@
 from copy import deepcopy
-from pathlib import Path
 from torch import nn, Tensor, FloatTensor
 from torch.nn.functional import pad
 from transformers import AutoModelForCausalLM, AutoConfig, LogitsProcessor, LogitsProcessorList # type: ignore
@@ -10,8 +9,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-LLM_LOCAL_DIR = Path("models/Qwen3-0.6B")
-
 from .skin_vae_model import SkinVAEModel
 from .skin_vae.autoencoders import SkinFSQCVAEModel
 from .spec import ModelSpec, ModelInput, VaeInput, TokenRigResult
@@ -21,14 +18,21 @@ from ..rig_package.info.asset import Asset
 from ..tokenizer.spec import Tokenizer
 from ..tokenizer.spec import DetokenizeOutput
 from ..tokenizer.parse import get_tokenizer
+from ..paths import resolve_model_path
+
+LLM_LOCAL_DIR = resolve_model_path("models/Qwen3-0.6B")
 
 try:
     from flash_attn_interface import flash_attn_func # type: ignore
-except Exception as e:
-    from flash_attn.flash_attn_interface import flash_attn_func as _flash_attn_func
-    def flash_attn_func(*args, **kwargs):
-        res = _flash_attn_func(*args, **kwargs)
-        return res, None
+except Exception:
+    try:
+        from flash_attn.flash_attn_interface import flash_attn_func as _flash_attn_func
+        def flash_attn_func(*args, **kwargs):
+            res = _flash_attn_func(*args, **kwargs)
+            return res, None
+    except Exception:
+        def flash_attn_func(q, k, v, *args, **kwargs):
+            return torch.nn.functional.scaled_dot_product_attention(q, k, v), None
 
 class VocabSwitchingLogitsProcessor(LogitsProcessor):
     def __init__(self, tokenizer: Tokenizer, switch_token_id, eos_token_id, tokens_per_skin, init):
@@ -77,7 +81,9 @@ class TokenRig(ModelSpec):
         self.skin_warmup_start_epoch: int = cfg.get('skin_warmup_start_epoch', 0)
         self.skin_warmup_end_epoch: int = cfg.get('skin_warmup_end_epoch', -1)
 
-        self.vae = SkinVAEModel.load_from_system_checkpoint(cfg['pretrained_vae']).to(torch.bfloat16)
+        pretrained_vae = str(resolve_model_path(cfg['pretrained_vae']))
+        self.model_config['pretrained_vae'] = pretrained_vae
+        self.vae = SkinVAEModel.load_from_system_checkpoint(pretrained_vae).to(torch.bfloat16)
         for param in self.vae.parameters():
             param.requires_grad_(False)
         self.vae.eval()
@@ -103,7 +109,7 @@ class TokenRig(ModelSpec):
             _d['pretrained_model_name_or_path'] = str(LLM_LOCAL_DIR)
         llm_config = AutoConfig.from_pretrained(**_d)
         self.vocab_size = self.tokenizer.vocab_size + self.vae.vocab_size + 1
-        llm_config.torch_dtype = torch.bfloat16
+        llm_config.dtype = torch.bfloat16
         llm_config.pre_norm = True
         self.llm_config = llm_config
         self.transformer = AutoModelForCausalLM.from_config(config=llm_config, attn_implementation="flash_attention_2").to(torch.bfloat16)
