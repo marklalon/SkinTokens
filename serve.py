@@ -231,12 +231,11 @@ async def _to_thread_cancellable(operation, *args, cancellation: CancellationTok
 # Generation parameters
 # --------------------------------------------------------------------------- #
 class GenParams(BaseModel):
-    top_k: int = 5
-    top_p: float = 0.95
-    temperature: float = 1.0
-    repetition_penalty: float = 2.0
-    num_beams: int = 3
-    do_sample: bool = False
+    top_k: int = 1
+    top_p: float = 1.0
+    temperature: float = 0.1
+    repetition_penalty: float = 1.0
+    num_beams: int = 5
     use_skeleton: bool = False
     use_transfer: bool = False
     use_postprocess: bool = False
@@ -432,7 +431,7 @@ def _run_generation(
                 repetition_penalty=params.repetition_penalty,
                 num_return_sequences=1,
                 num_beams=params.num_beams,
-                do_sample=params.do_sample,
+                do_sample=True,
             )
 
             if "skeleton_tokens" in batch and "skeleton_mask" in batch:
@@ -445,15 +444,12 @@ def _run_generation(
             if progress_callback:
                 progress_callback(30, "model sampling")
 
-            _ps_t0 = time.monotonic()
             with torch.inference_mode():
                 preds: List[TokenRigResult] = state.model.predict_step(
                     batch,
                     skeleton_tokens=[skeleton_tokens] if skeleton_tokens is not None else None,
                     make_asset=True,
                 )["results"]
-            _ps_t1 = time.monotonic()
-            logger.info("[%s] predict_step total: %.3fs", request_id, _ps_t1 - _ps_t0)
 
             cancellation.raise_if_cancelled()
             if progress_callback:

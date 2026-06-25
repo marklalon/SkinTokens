@@ -79,7 +79,7 @@ async def _run(args) -> None:
         "temperature": args.temperature,
         "repetition_penalty": args.repetition_penalty,
         "num_beams": args.num_beams,
-        "do_sample": args.do_sample,
+        "do_sample": True,
         "use_skeleton": args.use_skeleton,
         "use_transfer": args.use_transfer,
         "use_postprocess": args.use_postprocess,
@@ -148,12 +148,11 @@ def main() -> None:
     parser.add_argument("--output", default="outputs/output.glb", help="Output GLB path")
     parser.add_argument("--server", default="http://localhost:8087", help="Server base URL")
 
-    parser.add_argument("--top-k", type=int, default=5, help="Top-k sampling (default: 5)")
-    parser.add_argument("--top-p", type=float, default=0.95, help="Top-p sampling (default: 0.95)")
-    parser.add_argument("--temperature", type=float, default=1.0, help="Temperature (default: 1.0)")
-    parser.add_argument("--repetition-penalty", type=float, default=2.0, help="Repetition penalty (default: 2.0)")
-    parser.add_argument("--num-beams", type=int, default=3, help="Number of beams (default: 3)")
-    parser.add_argument("--do-sample", action="store_true", help="Enable sampling (default: False, beam search)")
+    parser.add_argument("--top-k", type=int, default=1, help="Top-k sampling (default: 1)")
+    parser.add_argument("--top-p", type=float, default=1.0, help="Top-p sampling (default: 1.0)")
+    parser.add_argument("--temperature", type=float, default=0.1, help="Temperature (default: 0.1)")
+    parser.add_argument("--repetition-penalty", type=float, default=1.0, help="Repetition penalty (default: 1.0)")
+    parser.add_argument("--num-beams", type=int, default=5, help="Number of beams (default: 5)")
 
     parser.add_argument("--use-skeleton", action="store_true", help="Use skeleton for skin generation")
     parser.add_argument("--use-transfer", action="store_true", help="Use transfer to maintain texture")
