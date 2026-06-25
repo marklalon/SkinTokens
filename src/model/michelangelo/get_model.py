@@ -7,6 +7,7 @@ def get_encoder(
     freeze_decoder: bool=False,
     **kwargs
 ) -> AlignedShapeLatentPerceiver:
+    kwargs.setdefault("flash", True)
     model = AlignedShapeLatentPerceiver(**kwargs)
     if pretrained_path is not None:
         state_dict = torch.load(pretrained_path, weights_only=True)
@@ -23,6 +24,7 @@ def get_encoder_simplified(
     pretrained_path: str=None,
     **kwargs
 ) -> ShapeAsLatentPerceiverEncoder:
+    kwargs.setdefault("flash", True)
     model = ShapeAsLatentPerceiverEncoder(**kwargs)
     if pretrained_path is not None:
         state_dict = torch.load(pretrained_path, weights_only=True)

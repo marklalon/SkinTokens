@@ -6,6 +6,7 @@ from typing import Dict, List, Tuple
 
 import math
 import numpy as np
+import time
 import torch
 import torch.nn.functional as F
 
@@ -50,14 +51,14 @@ class VocabSwitchingLogitsProcessor(LogitsProcessor):
             sequence = torch.cat([self.init, sequence])
             length = len(sequence)
             if self.switch_token_id in sequence:
-                mask[self.switch_token_id:] = 0
-                where = torch.where(sequence == self.switch_token_id)[0][:1]
+                where = torch.where(sequence == self.switch_token_id)[0][0]
                 J = self.tokenizer.bones_in_sequence(ids=sequence.detach().cpu().numpy())
-                if (length-where) == J*self.tokens_per_skin:
-                    mask[:] = float('-inf')
+                skin_token_count = length - where.item() - 1
+                expected_skin_tokens = J * self.tokens_per_skin
+                if skin_token_count >= expected_skin_tokens:
                     mask[self.eos_token_id] = 0
                 else:
-                    mask[self.eos_token_id] = float('-inf')
+                    mask[self.tokenizer.vocab_size:self.eos_token_id] = 0
             else:
                 tokens = self.tokenizer.next_posible_token(ids=sequence.detach().cpu().numpy())
                 mask[tokens] = 0
@@ -261,7 +262,8 @@ class TokenRig(ModelSpec):
                 tokens_per_skin=self.tokens_per_skin,
                 start_tokens=start_tokens[0],
             ),
-            **kwargs,
+            repetition_penalty=None,  # handled by logits_processor instead
+            **{k: v for k, v in kwargs.items() if k != 'repetition_penalty'},
         )
         
         res = TokenRigResult()
@@ -403,8 +405,21 @@ class TokenRig(ModelSpec):
             )
             if make_asset:
                 assert 'model_input' in batch, "need model_input to make asset (in validate/predict mode)"
-                assert res.detokenize_output is not None
-                assert res.skin_pred is not None
+                if res.detokenize_output is None:
+                    raise ValueError("generation produced an undecodable skeleton")
+                if res.skin_pred is None:
+                    where_eos = (
+                        torch.where(res.output_ids == self.tokenizer.eos)[0]
+                        if res.output_ids is not None else torch.empty(0, device=vertices.device)
+                    )
+                    actual = 0
+                    if res.output_ids is not None and where_eos.numel() > 0:
+                        actual = max(0, res.output_ids.shape[0] - where_eos[0].item() - 1)
+                    expected = res.detokenize_output.joints.shape[0] * self.tokens_per_skin
+                    raise ValueError(
+                        "generation produced incomplete skin tokens: "
+                        f"expected {expected}, got {actual}"
+                    )
                 asset: Asset = batch['model_input'][i].asset.copy()
                 res.asset = Asset.from_data(
                     vertices=asset.vertices,

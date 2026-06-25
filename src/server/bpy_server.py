@@ -70,15 +70,12 @@ def run():
         try:
             data = _resolve_payload(bytes_to_object(d[1]))
             if op == 'load':
-                print("[SERVER] received load path:", data)
                 asset = BpyParser.load(data)
                 result_queue.put(asset)
             elif op == 'export':
-                print("[SERVER] received export path:", data['filepath'])
                 BpyParser.export(**data)
                 result_queue.put('ok')
             elif op == 'transfer':
-                print("[SERVER] received transfer path:", data['target_path'])
                 transfer_rigging(**data)
                 result_queue.put('ok')
             else:

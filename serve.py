@@ -6,6 +6,16 @@ Clients submit a 3D file (OBJ/FBX/GLB) and receive a rigged GLB over HTTP or
 WebSocket. Generations are serialized through a single-GPU work queue so the
 server can accept many concurrent connections while running one job at a time.
 
+.. note::
+
+    Results are **non-deterministic** — the same input file may produce a
+    different skeleton (joint count / structure) across runs, even with identical
+    parameters (``do_sample=False``, same ``num_beams``).  This is inherent to
+    flash_attention_2 + bf16: the tiling algorithm introduces tiny floating-point
+    differences per forward pass, which accumulate over 28 transformer layers and
+    cause beam‑search tie‑breaking to diverge.  TF32 remains enabled for speed;
+    disabling it would reduce — but not eliminate — this effect.
+
 Run:
     python serve.py --host 0.0.0.0 --port 8087
 
@@ -225,7 +235,8 @@ class GenParams(BaseModel):
     top_p: float = 0.95
     temperature: float = 1.0
     repetition_penalty: float = 2.0
-    num_beams: int = 10
+    num_beams: int = 3
+    do_sample: bool = False
     use_skeleton: bool = False
     use_transfer: bool = False
     use_postprocess: bool = False
@@ -238,8 +249,8 @@ def _start_bpy_server():
     """Start the Blender Python server subprocess."""
     popen_kwargs = dict(
         args=[sys.executable, "bpy_server.py"],
-        stdout=None,
-        stderr=None,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
     if os.name == "nt":
         popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -414,14 +425,14 @@ def _run_generation(
                 batch.pop("skeleton_mask", None)
 
             batch["generate_kwargs"] = dict(
-                max_length=2048,
+                max_new_tokens=2048,
                 top_k=params.top_k,
                 top_p=params.top_p,
                 temperature=params.temperature,
                 repetition_penalty=params.repetition_penalty,
                 num_return_sequences=1,
                 num_beams=params.num_beams,
-                do_sample=True,
+                do_sample=params.do_sample,
             )
 
             if "skeleton_tokens" in batch and "skeleton_mask" in batch:
@@ -434,11 +445,14 @@ def _run_generation(
             if progress_callback:
                 progress_callback(30, "model sampling")
 
+            _ps_t0 = time.monotonic()
             preds: List[TokenRigResult] = state.model.predict_step(
                 batch,
                 skeleton_tokens=[skeleton_tokens] if skeleton_tokens is not None else None,
                 make_asset=True,
             )["results"]
+            _ps_t1 = time.monotonic()
+            logger.info("[%s] predict_step total: %.3fs", request_id, _ps_t1 - _ps_t0)
 
             cancellation.raise_if_cancelled()
             if progress_callback:
@@ -511,20 +525,29 @@ def _post_bpy_payload(endpoint: str, payload):
     import requests as req_lib
     from src.server.spec import BPY_SERVER, object_to_bytes, bytes_to_object
 
+    _t0 = time.monotonic()
     payload_path = None
     try:
         with tempfile.NamedTemporaryFile(
             prefix=f"skintokens_{endpoint}_", suffix=".pt", delete=False
         ) as f:
-            f.write(object_to_bytes(payload))
+            serialized = object_to_bytes(payload)
+            f.write(serialized)
             payload_path = f.name
+        _t1 = time.monotonic()
         request_payload = {"payload_path": payload_path}
         response = req_lib.post(
             f"{BPY_SERVER}/{endpoint}",
             data=object_to_bytes(request_payload),
         )
         response.raise_for_status()
+        _t2 = time.monotonic()
         result = bytes_to_object(response.content)
+        _t3 = time.monotonic()
+        logger.info(
+            "bpy %s: serialize=%.3fs request=%.3fs deserialize=%.3fs total=%.3fs size=%d",
+            endpoint, _t1 - _t0, _t2 - _t1, _t3 - _t2, _t3 - _t0, len(serialized),
+        )
         if isinstance(result, dict) and result.get("error") is not None:
             raise RuntimeError(result.get("traceback") or result["error"])
         return result
@@ -686,7 +709,8 @@ async def generate(
     top_p: float = Form(0.95),
     temperature: float = Form(1.0),
     repetition_penalty: float = Form(2.0),
-    num_beams: int = Form(10),
+    num_beams: int = Form(3),
+    do_sample: bool = Form(False),
     use_skeleton: bool = Form(False),
     use_transfer: bool = Form(False),
     use_postprocess: bool = Form(False),
@@ -704,6 +728,7 @@ async def generate(
     params = GenParams(
         top_k=top_k, top_p=top_p, temperature=temperature,
         repetition_penalty=repetition_penalty, num_beams=num_beams,
+        do_sample=do_sample,
         use_skeleton=use_skeleton, use_transfer=use_transfer,
         use_postprocess=use_postprocess,
     )

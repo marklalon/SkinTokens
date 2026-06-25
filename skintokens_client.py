@@ -79,6 +79,7 @@ async def _run(args) -> None:
         "temperature": args.temperature,
         "repetition_penalty": args.repetition_penalty,
         "num_beams": args.num_beams,
+        "do_sample": args.do_sample,
         "use_skeleton": args.use_skeleton,
         "use_transfer": args.use_transfer,
         "use_postprocess": args.use_postprocess,
@@ -124,7 +125,8 @@ async def _run(args) -> None:
                     elif stage == "cancelled":
                         raise asyncio.CancelledError(message.get("message"))
                     elif stage == "error":
-                        raise RuntimeError(message.get("message", "unknown server error"))
+                        err_msg = message.get("message") or "unknown server error"
+                        raise RuntimeError(err_msg)
                     else:
                         print(f"[client] server stage: {stage}")
             except asyncio.CancelledError:
@@ -150,7 +152,8 @@ def main() -> None:
     parser.add_argument("--top-p", type=float, default=0.95, help="Top-p sampling (default: 0.95)")
     parser.add_argument("--temperature", type=float, default=1.0, help="Temperature (default: 1.0)")
     parser.add_argument("--repetition-penalty", type=float, default=2.0, help="Repetition penalty (default: 2.0)")
-    parser.add_argument("--num-beams", type=int, default=10, help="Number of beams (default: 10)")
+    parser.add_argument("--num-beams", type=int, default=3, help="Number of beams (default: 3)")
+    parser.add_argument("--do-sample", action="store_true", help="Enable sampling (default: False, beam search)")
 
     parser.add_argument("--use-skeleton", action="store_true", help="Use skeleton for skin generation")
     parser.add_argument("--use-transfer", action="store_true", help="Use transfer to maintain texture")
@@ -165,7 +168,10 @@ def main() -> None:
         print("\n[client] cancelled", file=sys.stderr)
         raise SystemExit(130)
     except Exception as exc:
-        print(f"[client] error: {exc}", file=sys.stderr)
+        err_msg = str(exc).strip()
+        if not err_msg:
+            err_msg = f"{type(exc).__name__} (no detail – check server logs)"
+        print(f"[client] error: {err_msg}", file=sys.stderr)
         raise SystemExit(1)
 
 

@@ -196,7 +196,7 @@ def run_rig(
             batch.pop("skeleton_mask", None)
 
         batch["generate_kwargs"] = dict(
-            max_length=2048,
+            max_new_tokens=2048,
             top_k=int(top_k),
             top_p=float(top_p),
             temperature=float(temperature),

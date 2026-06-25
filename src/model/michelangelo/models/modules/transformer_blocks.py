@@ -13,9 +13,8 @@ from ...utils.misc import use_flash3
 
 if use_flash3.is_use:
     from flash_attn_interface import flash_attn_func
-    print("use flash attention 3.")
 else:
-    print("use flash attention 2.")
+    pass
 
 def init_linear(l, stddev):
     nn.init.normal_(l.weight, std=stddev)
@@ -23,32 +22,14 @@ def init_linear(l, stddev):
         nn.init.constant_(l.bias, 0.0)
 
 def flash_attention(q, k, v):
-    with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=False):
-        if use_flash3.is_use:
-            out, _ = flash_attn_func(q.contiguous(), k.contiguous(), v.contiguous())
-            # out = flash_attn_func(q, k, v)
-
-            # q_ = q.transpose(1, 2)
-            # k_ = k.transpose(1, 2)
-            # v_ = v.transpose(1, 2)
-
-            # # print(q.shape, k.shape, v.shape)
-            # out_ = F.scaled_dot_product_attention(q_, k_, v_)
-            # out_ = out_.transpose(1, 2)
-
-            # # print(torch.abs(out - out_).mean())
-            # assert torch.abs(out - out_).mean() < 1e-2, f"the error {torch.abs(out - out_).mean()} is  too large"
-
-            # out = out_
-
-            # print("use flash_atten 3")
-        else:
-            q = q.transpose(1, 2)
-            k = k.transpose(1, 2)
-            v = v.transpose(1, 2)
-            out = F.scaled_dot_product_attention(q, k, v)
-            out = out.transpose(1, 2)
-            # print("use flash atten 2")
+    if use_flash3.is_use:
+        out, _ = flash_attn_func(q.contiguous(), k.contiguous(), v.contiguous())
+    else:
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        out = F.scaled_dot_product_attention(q, k, v)
+        out = out.transpose(1, 2)
 
     return out
 
