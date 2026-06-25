@@ -43,27 +43,72 @@ class VocabSwitchingLogitsProcessor(LogitsProcessor):
         self.eos_token_id = eos_token_id
         self.tokens_per_skin = tokens_per_skin
         self.init = init
+        if isinstance(init, Tensor):
+            self.init_ids = init.detach().cpu().numpy().astype(np.int64)
+        else:
+            self.init_ids = np.asarray(init, dtype=np.int64)
+        self._allowed_tokens_cache: Dict[Tuple[int, ...], Tuple[int, ...]] = {}
+        self._skeleton_bones_cache: Dict[Tuple[int, ...], int] = {}
+        self._mask_cache: Dict[Tuple[object, ...], Tensor] = {}
+
+    def _mask_for_tokens(self, scores: FloatTensor, tokens: Tuple[int, ...]) -> Tensor:
+        key = ("tokens", scores.device.type, scores.device.index, scores.dtype, scores.shape[-1], tokens)
+        mask = self._mask_cache.get(key)
+        if mask is None:
+            mask = scores.new_full((scores.shape[-1],), float("-inf"))
+            mask[list(tokens)] = 0
+            self._mask_cache[key] = mask
+        return mask
+
+    def _skin_mask(self, scores: FloatTensor) -> Tensor:
+        key = ("skin", scores.device.type, scores.device.index, scores.dtype, scores.shape[-1])
+        mask = self._mask_cache.get(key)
+        if mask is None:
+            mask = scores.new_full((scores.shape[-1],), float("-inf"))
+            mask[self.tokenizer.vocab_size:self.eos_token_id] = 0
+            self._mask_cache[key] = mask
+        return mask
+
+    def _final_eos_mask(self, scores: FloatTensor) -> Tensor:
+        key = ("final_eos", scores.device.type, scores.device.index, scores.dtype, scores.shape[-1])
+        mask = self._mask_cache.get(key)
+        if mask is None:
+            mask = scores.new_full((scores.shape[-1],), float("-inf"))
+            mask[self.eos_token_id] = 0
+            self._mask_cache[key] = mask
+        return mask
 
     def __call__(self, input_ids: Tensor, scores: FloatTensor) -> FloatTensor:
-        # input_ids shape: (batch_size, seq_len)
-        for batch_idx, sequence in enumerate(input_ids):
-            mask = torch.full_like(scores[batch_idx], float('-inf'))
-            sequence = torch.cat([self.init, sequence])
-            length = len(sequence)
-            if self.switch_token_id in sequence:
-                where = torch.where(sequence == self.switch_token_id)[0][0]
-                J = self.tokenizer.bones_in_sequence(ids=sequence.detach().cpu().numpy())
-                skin_token_count = length - where.item() - 1
+        # HuggingFace calls logits processors once per generated token.  Keep the
+        # unavoidable CPU-side tokenizer logic to one device sync per call and
+        # cache grammar/skin masks so beams do not repeatedly rescan prefixes.
+        input_ids_cpu = input_ids.detach().cpu().numpy()
+        masks = []
+        for sequence in input_ids_cpu:
+            sequence = np.concatenate((self.init_ids, sequence.astype(np.int64, copy=False)))
+            switch_positions = np.flatnonzero(sequence == self.switch_token_id)
+            if switch_positions.size > 0:
+                where = int(switch_positions[0])
+                skeleton_key = tuple(int(x) for x in sequence[:where + 1])
+                J = self._skeleton_bones_cache.get(skeleton_key)
+                if J is None:
+                    J = self.tokenizer.bones_in_sequence(ids=sequence)
+                    self._skeleton_bones_cache[skeleton_key] = J
+                skin_token_count = len(sequence) - where - 1
                 expected_skin_tokens = J * self.tokens_per_skin
-                if skin_token_count >= expected_skin_tokens:
-                    mask[self.eos_token_id] = 0
-                else:
-                    mask[self.tokenizer.vocab_size:self.eos_token_id] = 0
+                masks.append(
+                    self._final_eos_mask(scores)
+                    if skin_token_count >= expected_skin_tokens
+                    else self._skin_mask(scores)
+                )
             else:
-                tokens = self.tokenizer.next_posible_token(ids=sequence.detach().cpu().numpy())
-                mask[tokens] = 0
-            scores[batch_idx] = scores[batch_idx] + mask
-        return scores
+                prefix_key = tuple(int(x) for x in sequence)
+                tokens = self._allowed_tokens_cache.get(prefix_key)
+                if tokens is None:
+                    tokens = tuple(self.tokenizer.next_posible_token(ids=sequence))
+                    self._allowed_tokens_cache[prefix_key] = tokens
+                masks.append(self._mask_for_tokens(scores, tokens))
+        return scores + torch.stack(masks, dim=0)
 
 class TokenRig(ModelSpec):
 
@@ -120,6 +165,14 @@ class TokenRig(ModelSpec):
             self.transformer = AutoModelForCausalLM.from_config(
                 config=llm_config, attn_implementation="flash_attention_2"
             )
+        # Silence "not valid generation flags" warnings for sampling params
+        # that are passed via **kwargs but missing from the auto-generated config.
+        if not hasattr(self.transformer.generation_config, "top_p") or self.transformer.generation_config.top_p is None:
+            self.transformer.generation_config.top_p = None
+        if not hasattr(self.transformer.generation_config, "top_k") or self.transformer.generation_config.top_k is None:
+            self.transformer.generation_config.top_k = None
+        if not hasattr(self.transformer.generation_config, "temperature") or self.transformer.generation_config.temperature is None:
+            self.transformer.generation_config.temperature = None
         
         self.output_proj = nn.Sequential(
             nn.Linear(self.mesh_encoder.width, self.hidden_size),
@@ -130,11 +183,7 @@ class TokenRig(ModelSpec):
         if init_scale is not None:
             self.initialize_weights(init_scale)
     
-    def compile_model(self):
-        self.vae.compile_model()
-        self.transformer = torch.compile(self.transformer, dynamic=False)
-        self.mesh_encoder = torch.compile(self.mesh_encoder, dynamic=False)
-        
+
     def initialize_weights(self, s: float):
         def init_linear(l, stddev):
             nn.init.normal_(l.weight, std=stddev)
@@ -204,6 +253,7 @@ class TokenRig(ModelSpec):
             start_tokens_list.append(start_tokens)
         return start_tokens_list
     
+    @torch.inference_mode()
     @torch.autocast(device_type='cuda', dtype=torch.bfloat16)
     def generate(
         self,
@@ -371,6 +421,7 @@ class TokenRig(ModelSpec):
             res.append(_d)
         return res
     
+    @torch.inference_mode()
     def predict_step(
         self,
         batch: Dict,

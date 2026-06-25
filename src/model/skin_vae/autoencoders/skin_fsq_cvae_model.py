@@ -295,10 +295,6 @@ class SkinFSQCVAEModel(ModelMixin, ConfigMixin):
 
         return torch.cat(dec, dim=1)
     
-    def compile_model(self):
-        self.encoder = torch.compile(self.encoder)
-        self.cond_encoder = torch.compile(self.cond_encoder)
-        self.decoder = torch.compile(self.decoder)
-    
+
     def forward(self, x: torch.Tensor):
         pass

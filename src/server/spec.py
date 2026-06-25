@@ -83,4 +83,7 @@ def get_model(
         model.transformer.model.load_state_dict(a.state_dict())
 
     model = model.to(device)
+    if hasattr(model.transformer, "config") and hasattr(model.transformer.config, "use_cache"):
+        model.transformer.config.use_cache = True
+    model.eval()
     return model

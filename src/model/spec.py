@@ -74,12 +74,7 @@ class ModelSpec(pl.LightningModule, ABC):
         """
         raise NotImplementedError()
     
-    def compile_model(self):
-        """
-        Compile the model. Do this before training and after loading state dicts.
-        """
-        pass
-    
+
     @classmethod
     def load_from_system_checkpoint(cls, checkpoint_path: str, strict: bool=True, **kwargs):
         checkpoint_path = str(resolve_model_path(checkpoint_path))

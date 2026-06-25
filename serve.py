@@ -396,7 +396,7 @@ def _run_generation(
             shuffle=False,
             batch_size=1,
             num_workers=1,
-            pin_memory=True,
+            pin_memory=DEVICE.startswith("cuda"),
             persistent_workers=False,
             datapath=datapath,
         ).split_by_cls()
@@ -416,7 +416,7 @@ def _run_generation(
 
         for batch in dataloader:
             batch = {
-                k: v.to(state.model.device) if isinstance(v, Tensor) else v
+                k: v.to(state.model.device, non_blocking=True) if isinstance(v, Tensor) else v
                 for k, v in batch.items()
             }
 
@@ -446,11 +446,12 @@ def _run_generation(
                 progress_callback(30, "model sampling")
 
             _ps_t0 = time.monotonic()
-            preds: List[TokenRigResult] = state.model.predict_step(
-                batch,
-                skeleton_tokens=[skeleton_tokens] if skeleton_tokens is not None else None,
-                make_asset=True,
-            )["results"]
+            with torch.inference_mode():
+                preds: List[TokenRigResult] = state.model.predict_step(
+                    batch,
+                    skeleton_tokens=[skeleton_tokens] if skeleton_tokens is not None else None,
+                    make_asset=True,
+                )["results"]
             _ps_t1 = time.monotonic()
             logger.info("[%s] predict_step total: %.3fs", request_id, _ps_t1 - _ps_t0)
 
@@ -525,7 +526,6 @@ def _post_bpy_payload(endpoint: str, payload):
     import requests as req_lib
     from src.server.spec import BPY_SERVER, object_to_bytes, bytes_to_object
 
-    _t0 = time.monotonic()
     payload_path = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -534,20 +534,13 @@ def _post_bpy_payload(endpoint: str, payload):
             serialized = object_to_bytes(payload)
             f.write(serialized)
             payload_path = f.name
-        _t1 = time.monotonic()
         request_payload = {"payload_path": payload_path}
         response = req_lib.post(
             f"{BPY_SERVER}/{endpoint}",
             data=object_to_bytes(request_payload),
         )
         response.raise_for_status()
-        _t2 = time.monotonic()
         result = bytes_to_object(response.content)
-        _t3 = time.monotonic()
-        logger.info(
-            "bpy %s: serialize=%.3fs request=%.3fs deserialize=%.3fs total=%.3fs size=%d",
-            endpoint, _t1 - _t0, _t2 - _t1, _t3 - _t2, _t3 - _t0, len(serialized),
-        )
         if isinstance(result, dict) and result.get("error") is not None:
             raise RuntimeError(result.get("traceback") or result["error"])
         return result

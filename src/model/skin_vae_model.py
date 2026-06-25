@@ -74,9 +74,7 @@ class SkinVAEModel(ModelSpec):
         if self.sample_tokens != self.compress_tokens:
             self.up_perceiver = Perceiver(self.model.latent_channels, self.sample_tokens)
     
-    def compile_model(self):
-        self.model.compile_model()
-    
+
     @property
     def vocab_size(self) -> int:
         return self.model.FSQ.codebook_size

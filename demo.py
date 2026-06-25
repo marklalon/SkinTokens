@@ -169,7 +169,7 @@ def run_rig(
         shuffle=False,
         batch_size=1,
         num_workers=1,
-        pin_memory=True,
+        pin_memory=str(model.device).startswith("cuda"),
         persistent_workers=False,
         datapath=datapath,
     ).split_by_cls()
@@ -187,7 +187,7 @@ def run_rig(
 
     for i, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
         batch = {
-            k: v.to(model.device) if isinstance(v, Tensor) else v
+            k: v.to(model.device, non_blocking=True) if isinstance(v, Tensor) else v
             for k, v in batch.items()
         }
 
