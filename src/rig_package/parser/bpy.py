@@ -213,9 +213,12 @@ class BpyParser(AbstractParser):
     @classmethod
     def export_asset(cls, asset: Asset, filepath: str, **kwargs):
         use_origin = kwargs.pop('use_origin', False) if 'use_origin' in kwargs else False
+        auto_ground = kwargs.pop('auto_ground', False)
         if not use_origin:
             clean_bpy()
         make_asset(asset=asset, **kwargs)
+        if auto_ground:
+            ground_scene()
         cls._safe_make_dir(filepath)
         
         _, ext = os.path.splitext(filepath)
@@ -770,6 +773,31 @@ def estimate_similarity_transform(
         return _umeyama_similarity(src, tgt)
     return _pca_similarity(src, tgt, max_points)
 
+def ground_scene():
+    """Translate all root objects so the scene bounding-box bottom sits at Z=0.
+
+    Moves every top-level object (mesh + armature) together, keeping skinning
+    and relative transforms intact.
+    """
+    meshes = [obj for obj in bpy.context.scene.objects if obj.type == 'MESH']
+    if not meshes:
+        return
+
+    min_z = float('inf')
+    for obj in meshes:
+        for corner in obj.bound_box:
+            wc = obj.matrix_world @ Vector(corner)
+            min_z = min(min_z, wc.z)
+
+    if min_z == float('inf') or abs(min_z) < 1e-6:
+        return
+
+    delta = -min_z
+    for obj in bpy.context.scene.objects:
+        if obj.parent is None:
+            obj.location.z += delta
+
+
 def transfer_rigging(
     source_asset: Asset,
     target_path: str,
@@ -821,5 +849,6 @@ def transfer_rigging(
         dists, idx = tree.query(target_vertices, k=1)
         target_asset.skin = source_skin[idx]
     
-    BpyParser.export(target_asset, export_path, use_origin=True, **kwargs)
+    auto_ground = kwargs.pop('auto_ground', False)
+    BpyParser.export(target_asset, export_path, use_origin=True, auto_ground=auto_ground, **kwargs)
     clean_bpy()

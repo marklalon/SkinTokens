@@ -239,6 +239,7 @@ class GenParams(BaseModel):
     use_skeleton: bool = False
     use_transfer: bool = False
     use_postprocess: bool = False
+    auto_ground: bool = True
 
 
 # --------------------------------------------------------------------------- #
@@ -482,6 +483,7 @@ def _run_generation(
                     target_path=asset.path,
                     export_path=str(out_path),
                     group_per_vertex=4,
+                    auto_ground=params.auto_ground,
                 )
                 res = _post_bpy_payload("transfer", payload)
             else:
@@ -489,6 +491,7 @@ def _run_generation(
                     asset=asset,
                     filepath=str(out_path),
                     group_per_vertex=4,
+                    auto_ground=params.auto_ground,
                 )
                 res = _post_bpy_payload("export", payload)
 
@@ -703,6 +706,7 @@ async def generate(
     use_skeleton: bool = Form(False),
     use_transfer: bool = Form(False),
     use_postprocess: bool = Form(False),
+    auto_ground: bool = Form(True),
 ):
     """Multipart upload a 3D file -> binary GLB response with rigging."""
     request_id = uuid.uuid4().hex[:8]
@@ -720,6 +724,7 @@ async def generate(
         do_sample=do_sample,
         use_skeleton=use_skeleton, use_transfer=use_transfer,
         use_postprocess=use_postprocess,
+        auto_ground=auto_ground,
     )
 
     try:
