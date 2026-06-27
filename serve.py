@@ -242,7 +242,6 @@ class GenParams(BaseModel):
     num_beams: int = 5
     use_skeleton: bool = False
     use_postprocess: bool = False
-    rename_conf_thresh: float = 0.8
 
 
 # --------------------------------------------------------------------------- #
@@ -504,7 +503,7 @@ def _run_generation(
             glb_data = _run_skeleton_rename(
                 glb_data,
                 file_name=filename,
-                conf_thresh=params.rename_conf_thresh,
+                conf_thresh=0.8,
                 request_id=request_id,
             )
 
@@ -770,7 +769,6 @@ async def generate(
     do_sample: bool = Form(False),
     use_skeleton: bool = Form(False),
     use_postprocess: bool = Form(False),
-    rename_conf_thresh: float = Form(0.8),
 ):
     """Multipart upload a 3D file -> binary GLB response with rigging."""
     request_id = uuid.uuid4().hex[:8]
@@ -788,7 +786,6 @@ async def generate(
         do_sample=do_sample,
         use_skeleton=use_skeleton,
         use_postprocess=use_postprocess,
-        rename_conf_thresh=rename_conf_thresh,
     )
 
     try:
