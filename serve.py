@@ -83,6 +83,10 @@ STARTUP_HEARTBEAT_SEC = max(
     1.0, float(os.environ.get("SKINTOKENS_STARTUP_HEARTBEAT_SEC", "15"))
 )
 SUPPORTED_EXT = {".obj", ".fbx", ".glb"}
+SKELETON_RENAMER_URL = os.environ.get(
+    "SKINTOKENS_SKELETON_RENAMER_URL",
+    "http://skeleton-renamer:8088",
+)
 
 
 def _run_startup_stage(label: str, operation):
@@ -237,9 +241,8 @@ class GenParams(BaseModel):
     repetition_penalty: float = 1.0
     num_beams: int = 5
     use_skeleton: bool = False
-    use_transfer: bool = False
     use_postprocess: bool = False
-    auto_ground: bool = True
+    rename_conf_thresh: float = 0.8
 
 
 # --------------------------------------------------------------------------- #
@@ -477,23 +480,14 @@ def _run_generation(
 
             out_path.parent.mkdir(parents=True, exist_ok=True)
 
-            if params.use_transfer:
-                payload = dict(
-                    source_asset=asset,
-                    target_path=asset.path,
-                    export_path=str(out_path),
-                    group_per_vertex=4,
-                    auto_ground=params.auto_ground,
-                )
-                res = _post_bpy_payload("transfer", payload)
-            else:
-                payload = dict(
-                    asset=asset,
-                    filepath=str(out_path),
-                    group_per_vertex=4,
-                    auto_ground=params.auto_ground,
-                )
-                res = _post_bpy_payload("export", payload)
+            payload = dict(
+                source_asset=asset,
+                target_path=asset.path,
+                export_path=str(out_path),
+                group_per_vertex=4,
+                auto_ground=True,
+            )
+            res = _post_bpy_payload("transfer", payload)
 
             cancellation.raise_if_cancelled()
 
@@ -504,6 +498,15 @@ def _run_generation(
                 progress_callback(95, "reading output")
 
             glb_data = out_path.read_bytes()
+
+            if progress_callback:
+                progress_callback(96, "skeleton rename")
+            glb_data = _run_skeleton_rename(
+                glb_data,
+                file_name=filename,
+                conf_thresh=params.rename_conf_thresh,
+                request_id=request_id,
+            )
 
             if progress_callback:
                 progress_callback(100, "complete")
@@ -518,6 +521,67 @@ def _run_generation(
             shutil.rmtree(tmp_input_dir, ignore_errors=True)
         with suppress(OSError):
             shutil.rmtree(tmp_output_dir, ignore_errors=True)
+
+
+def _run_skeleton_rename(
+    glb_data: bytes,
+    file_name: str,
+    conf_thresh: float,
+    request_id: str,
+) -> bytes:
+    """Send GLB data to the remote skeleton renamer service via WebSocket and
+    return the renamed GLB bytes."""
+    import asyncio as _asyncio
+    import base64 as _base64
+    import json as _json
+
+    ws_url = SKELETON_RENAMER_URL.rstrip("/")
+    if ws_url.startswith("https://"):
+        ws_url = "wss://" + ws_url[len("https://"):]
+    elif ws_url.startswith("http://"):
+        ws_url = "ws://" + ws_url[len("http://"):]
+    elif not ws_url.startswith(("ws://", "wss://")):
+        ws_url = "ws://" + ws_url
+    ws_url += "/ws/skeleton-renamer"
+
+    async def _rename():
+        import websockets as _ws
+        input_b64 = _base64.b64encode(glb_data).decode("ascii")
+        payload = _json.dumps({
+            "input_file_base64": input_b64,
+            "file_name": file_name,
+            "conf_thresh": conf_thresh,
+        })
+        async with _ws.connect(
+            ws_url,
+            max_size=64 * 1024 * 1024,
+            open_timeout=30,
+        ) as ws:
+            await ws.send(payload)
+            async for raw_message in ws:
+                message = _json.loads(raw_message)
+                stage = message.get("stage", "unknown")
+                if stage == "done":
+                    glb_b64 = message.get("glb_base64", "")
+                    if not glb_b64:
+                        raise RuntimeError("renamer returned done without glb_base64")
+                    return _base64.b64decode(glb_b64)
+                elif stage == "error":
+                    raise RuntimeError(message.get("message", "unknown renamer error"))
+                elif stage == "cancelled":
+                    raise RuntimeError(f"renamer cancelled: {message.get('message', '')}")
+            raise RuntimeError("WebSocket closed before renamer result")
+
+    logger.info("[%s] calling skeleton renamer at %s (file=%s, conf_thresh=%.2f)",
+                request_id, ws_url, file_name, conf_thresh)
+    try:
+        renamed = _asyncio.run(_rename())
+        logger.info("[%s] skeleton rename done: %d bytes -> %d bytes",
+                    request_id, len(glb_data), len(renamed))
+        return renamed
+    except Exception:
+        logger.error("[%s] skeleton renamer failed", request_id)
+        raise
 
 
 def _post_bpy_payload(endpoint: str, payload):
@@ -690,6 +754,7 @@ async def info():
         "busy": state.busy,
         "loaded_at": state.loaded_at,
         "cuda_device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        "skeleton_renamer_url": SKELETON_RENAMER_URL,
     }
 
 
@@ -704,9 +769,8 @@ async def generate(
     num_beams: int = Form(3),
     do_sample: bool = Form(False),
     use_skeleton: bool = Form(False),
-    use_transfer: bool = Form(False),
     use_postprocess: bool = Form(False),
-    auto_ground: bool = Form(True),
+    rename_conf_thresh: float = Form(0.8),
 ):
     """Multipart upload a 3D file -> binary GLB response with rigging."""
     request_id = uuid.uuid4().hex[:8]
@@ -722,9 +786,9 @@ async def generate(
         top_k=top_k, top_p=top_p, temperature=temperature,
         repetition_penalty=repetition_penalty, num_beams=num_beams,
         do_sample=do_sample,
-        use_skeleton=use_skeleton, use_transfer=use_transfer,
+        use_skeleton=use_skeleton,
         use_postprocess=use_postprocess,
-        auto_ground=auto_ground,
+        rename_conf_thresh=rename_conf_thresh,
     )
 
     try:

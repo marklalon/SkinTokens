@@ -81,9 +81,7 @@ async def _run(args) -> None:
         "num_beams": args.num_beams,
         "do_sample": True,
         "use_skeleton": args.use_skeleton,
-        "use_transfer": True,
         "use_postprocess": args.use_postprocess,
-        "auto_ground": args.auto_ground,
     }
 
     progress = ProgressDisplay()
@@ -157,7 +155,6 @@ def main() -> None:
 
     parser.add_argument("--use-skeleton", action="store_true", help="Use skeleton for skin generation")
     parser.add_argument("--use-postprocess", action="store_true", help="Use postprocess (voxel skin)")
-    parser.add_argument("--auto-ground", type=lambda x: x.lower() not in ("false", "0", "no", "off"), default=True, help="Align bounding-box bottom to ground plane (default: true)")
 
     parser.add_argument("--timeout", type=int, default=30, help="Connection timeout seconds")
     args = parser.parse_args()

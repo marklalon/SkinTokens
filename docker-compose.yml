@@ -17,6 +17,7 @@ services:
       SKINTOKENS_DEVICE: cuda
       SKINTOKENS_HOST: 0.0.0.0
       SKINTOKENS_PORT: 8000
+      SKINTOKENS_SKELETON_RENAMER_URL: http://pcvg:8000
       HF_HOME: /cache/huggingface
       TORCH_HOME: /cache/torch
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
@@ -37,6 +38,8 @@ services:
       timeout: 5s
       retries: 5
       start_period: 120s
+    networks:
+      - ai-shared
     deploy:
       resources:
         reservations:
@@ -50,4 +53,8 @@ volumes:
   torch_cache:
   models:
     name: models
+    external: true
+
+networks:
+  ai-shared:
     external: true
