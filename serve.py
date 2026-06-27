@@ -34,6 +34,7 @@ import argparse
 import asyncio
 import atexit
 import base64
+import json
 import logging
 import signal
 import subprocess
@@ -359,6 +360,8 @@ def _run_generation(
     request_id: str,
     cancellation: CancellationToken,
     progress_callback=None,
+    image_base64: str | None = None,
+    image_name: str | None = None,
 ) -> bytes:
     """Run the full rigging pipeline and return GLB bytes."""
     from pathlib import Path
@@ -500,17 +503,19 @@ def _run_generation(
 
             if progress_callback:
                 progress_callback(96, "skeleton rename")
-            glb_data = _run_skeleton_rename(
+            glb_data, renamer_meta = _run_skeleton_rename(
                 glb_data,
                 file_name=filename,
                 conf_thresh=0.8,
                 request_id=request_id,
+                image_base64=image_base64,
+                image_name=image_name,
             )
 
             if progress_callback:
                 progress_callback(100, "complete")
 
-            return glb_data
+            return glb_data, renamer_meta
 
         raise RuntimeError("No data in dataloader")
     finally:
@@ -527,9 +532,15 @@ def _run_skeleton_rename(
     file_name: str,
     conf_thresh: float,
     request_id: str,
+    image_base64: str | None = None,
+    image_name: str | None = None,
 ) -> bytes:
     """Send GLB data to the remote skeleton renamer service via WebSocket and
-    return the renamed GLB bytes."""
+    return the renamed GLB bytes.
+
+    If ``image_base64`` / ``image_name`` are provided they are forwarded to the
+    renamer for LLM-based species/skeleton verification.
+    """
     import asyncio as _asyncio
     import base64 as _base64
     import json as _json
@@ -546,11 +557,15 @@ def _run_skeleton_rename(
     async def _rename():
         import websockets as _ws
         input_b64 = _base64.b64encode(glb_data).decode("ascii")
-        payload = _json.dumps({
+        payload_dict: dict = {
             "input_file_base64": input_b64,
             "file_name": file_name,
             "conf_thresh": conf_thresh,
-        })
+        }
+        if image_base64 and image_name:
+            payload_dict["image_base64"] = image_base64
+            payload_dict["image_name"] = image_name
+        payload = _json.dumps(payload_dict)
         async with _ws.connect(
             ws_url,
             max_size=64 * 1024 * 1024,
@@ -564,20 +579,24 @@ def _run_skeleton_rename(
                     glb_b64 = message.get("glb_base64", "")
                     if not glb_b64:
                         raise RuntimeError("renamer returned done without glb_base64")
-                    return _base64.b64decode(glb_b64)
+                    renamer_meta = {k: v for k, v in message.items()
+                                    if k not in ("stage", "glb_base64")}
+                    return _base64.b64decode(glb_b64), renamer_meta
                 elif stage == "error":
                     raise RuntimeError(message.get("message", "unknown renamer error"))
                 elif stage == "cancelled":
                     raise RuntimeError(f"renamer cancelled: {message.get('message', '')}")
             raise RuntimeError("WebSocket closed before renamer result")
 
-    logger.info("[%s] calling skeleton renamer at %s (file=%s, conf_thresh=%.2f)",
-                request_id, ws_url, file_name, conf_thresh)
+    logger.info("[%s] calling skeleton renamer at %s (file=%s, conf_thresh=%.2f, image=%s)",
+                request_id, ws_url, file_name, conf_thresh,
+                image_name if image_name else "none")
     try:
-        renamed = _asyncio.run(_rename())
-        logger.info("[%s] skeleton rename done: %d bytes -> %d bytes",
-                    request_id, len(glb_data), len(renamed))
-        return renamed
+        renamed, renamer_meta = _asyncio.run(_rename())
+        logger.info("[%s] skeleton rename done: %d bytes -> %d bytes  meta=%s",
+                    request_id, len(glb_data), len(renamed),
+                    _json.dumps(renamer_meta, ensure_ascii=False)[:200])
+        return renamed, renamer_meta
     except Exception:
         logger.error("[%s] skeleton renamer failed", request_id)
         raise
@@ -648,8 +667,16 @@ async def _generate(
     request_id: str,
     progress_callback=None,
     cancellation: Optional[CancellationToken] = None,
-) -> bytes:
-    """Run generation with lock serialization."""
+    image_base64: str | None = None,
+    image_name: str | None = None,
+):
+    """Run generation with lock serialization.
+
+    Returns:
+        Tuple of (glb_bytes, renamer_meta).  renamer_meta is a dict of all
+        extra fields from the skeleton-renamer "done" message (e.g.
+        ``species``, ``species_tags``, ``joint_count``).
+    """
     cancellation = cancellation or CancellationToken()
     reporter = ProgressReporter(request_id, cancellation, progress_callback)
 
@@ -662,15 +689,15 @@ async def _generate(
         logger.info("[%s] generation lock acquired after %.2fs", request_id,
                     time.monotonic() - wait_started)
         try:
-            glb = await _to_thread_cancellable(
+            glb, renamer_meta = await _to_thread_cancellable(
                 _run_generation, file_data, filename, params, request_id,
-                cancellation, reporter.report,
+                cancellation, reporter.report, image_base64, image_name,
                 cancellation=cancellation,
             )
         finally:
             state.busy = False
 
-    return glb
+    return glb, renamer_meta
 
 
 # --------------------------------------------------------------------------- #
@@ -801,7 +828,7 @@ async def generate(
         _watch_http_disconnect(request, cancellation)
     )
     try:
-        glb = await _generate(
+        glb, _renamer_meta = await _generate(
             file_data, file.filename or "input.obj", params, request_id,
             cancellation=cancellation,
         )
@@ -863,11 +890,16 @@ async def ws_generate(ws: WebSocket):
             await ws.close()
             return
 
+        # Extract optional image for skeleton-renamer
+        image_base64: str | None = req.pop("image_base64", None)
+        image_name: str | None = req.pop("image_name", None)
+
         params = GenParams(
             **{k: v for k, v in req.items() if k in GenParams.model_fields}
         )
-        logger.info("[%s] file decoded bytes=%d filename=%s params=%s",
-                    request_id, len(file_data), filename, params.model_dump())
+        logger.info("[%s] file decoded bytes=%d filename=%s params=%s image=%s",
+                    request_id, len(file_data), filename, params.model_dump(),
+                    image_name if image_name else "none")
 
         loop = asyncio.get_running_loop()
         cancellation = CancellationToken()
@@ -899,6 +931,7 @@ async def ws_generate(ws: WebSocket):
             _generate(
                 file_data, filename, params, request_id, send_progress,
                 cancellation=cancellation,
+                image_base64=image_base64, image_name=image_name,
             )
         )
         receiver_task = asyncio.create_task(
@@ -932,16 +965,19 @@ async def ws_generate(ws: WebSocket):
         with suppress(asyncio.CancelledError):
             await receiver_task
 
-        glb = await generation_task
-        await ws.send_json({
+        glb, renamer_meta = await generation_task
+        done_msg: dict = {
             "stage": "done",
             "elapsed_sec": round(time.time() - t0, 2),
             "progress": 100,
             "request_id": request_id,
             "glb_base64": base64.b64encode(glb).decode("ascii"),
-        })
-        logger.info("[%s] WebSocket request completed bytes=%d elapsed=%.2fs",
-                    request_id, len(glb), time.time() - t0)
+        }
+        done_msg.update(renamer_meta)
+        await ws.send_json(done_msg)
+        logger.info("[%s] WebSocket request completed bytes=%d elapsed=%.2fs meta=%s",
+                    request_id, len(glb), time.time() - t0,
+                    json.dumps(renamer_meta, ensure_ascii=False)[:200])
         await ws.close()
 
     except WebSocketDisconnect:

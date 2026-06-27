@@ -4,6 +4,12 @@ Example:
     python skintokens_client.py --file assets/character.obj --output out.glb
     python skintokens_client.py --file model.fbx --server http://HOST:8087 \
         --use-skeleton --use-postprocess
+    python skintokens_client.py --file model.fbx --image char.png \
+        --server http://HOST:8087
+
+When ``--image`` is provided, a character reference image is sent through to the
+skeleton-renamer service (``SKINTOKENS_SKELETON_RENAMER_URL``) for LLM-based
+species/skeleton verification.
 
 Requires the ``websockets`` package.
 """
@@ -84,6 +90,12 @@ async def _run(args) -> None:
         "use_postprocess": args.use_postprocess,
     }
 
+    if args.image:
+        with open(args.image, "rb") as f:
+            payload["image_base64"] = base64.b64encode(f.read()).decode("ascii")
+            payload["image_name"] = os.path.basename(args.image)
+        print(f"[client] image attached: {args.image}")
+
     progress = ProgressDisplay()
     started_at = time.monotonic()
     print(f"[client] connecting {ws_url}")
@@ -120,6 +132,13 @@ async def _run(args) -> None:
                         with open(args.output, "wb") as f:
                             f.write(glb)
                         print(f"[client] saved {len(glb)} bytes -> {args.output}")
+                        renamer_meta = {k: v for k, v in message.items()
+                                         if k not in ("stage", "glb_base64",
+                                                      "elapsed_sec", "progress",
+                                                      "request_id")}
+                        if renamer_meta:
+                            for k, v in renamer_meta.items():
+                                print(f"[client] {k}: {v}")
                         return
                     elif stage == "cancelled":
                         raise asyncio.CancelledError(message.get("message"))
@@ -144,7 +163,14 @@ def main() -> None:
         description="SkinTokens / TokenRig WebSocket client with live progress"
     )
     parser.add_argument("--file", required=True, help="Input 3D file path (OBJ/FBX/GLB)")
-    parser.add_argument("--output", default="outputs/output.glb", help="Output GLB path")
+    parser.add_argument("--image", default=None,
+                        help="Character reference image (PNG/JPEG) forwarded to skeleton-renamer "
+                             "for LLM-based species/skeleton verification")
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="Output GLB path (default: outputs/<input_name>_skined.glb)",
+    )
     parser.add_argument("--server", default="http://localhost:8087", help="Server base URL")
 
     parser.add_argument("--top-k", type=int, default=1, help="Top-k sampling (default: 1)")
@@ -158,6 +184,10 @@ def main() -> None:
 
     parser.add_argument("--timeout", type=int, default=30, help="Connection timeout seconds")
     args = parser.parse_args()
+
+    if args.output is None:
+        input_name = os.path.splitext(os.path.basename(args.file))[0]
+        args.output = f"outputs/{input_name}_skined.glb"
 
     try:
         asyncio.run(_run(args))
