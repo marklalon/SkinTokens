@@ -109,14 +109,14 @@ Then open `http://127.0.0.1:1024` in your browser.
 # Rig a single model
 python demo.py --input examples/giraffe.glb --output results/giraffe.glb
 
-# Rig with original texture and scale preserved
-python demo.py --input examples/giraffe.glb --output results/giraffe.glb --use_transfer
-
 # Skin a model using its existing skeleton
-python demo.py --input examples/giraffe_skeleton.glb --output results/giraffe.glb --use_skeleton --use_transfer
+python demo.py --input examples/giraffe_skeleton.glb --output results/giraffe.glb --use_skeleton
 
-# Batch process a directory
-python demo.py --input examples/ --output results/ --use_transfer
+# Batch process a directory (output defaults to outputs/{input_name}_bind.glb)
+python demo.py --input examples/
+
+# Process directory with custom output directory
+python demo.py --input examples/ --output results/
 ```
 
 ### Docker (NVIDIA GPU)
@@ -167,13 +167,12 @@ and containers.
 
 | Parameter | Default | Description |
 | --- | --- | --- |
-| `--top_k` | 5 | Top-k sampling |
-| `--top_p` | 0.95 | Top-p (nucleus) sampling |
-| `--temperature` | 1.0 | Sampling temperature |
-| `--repetition_penalty` | 2.0 | Repetition penalty |
-| `--num_beams` | 10 | Number of beams for beam search |
+| `--top_k` | 1 | Top-k sampling |
+| `--top_p` | 1 | Top-p (nucleus) sampling |
+| `--temperature` | 0.1 | Sampling temperature |
+| `--repetition_penalty` | 1.0 | Repetition penalty |
+| `--num_beams` | 5 | Number of beams for beam search |
 | `--use_skeleton` | False | Use existing skeleton (generate skin only) |
-| `--use_transfer` | False | Transfer original texture and scale |
 | `--use_postprocess` | False | Apply voxel-based skin postprocessing |
 
 ### Troubleshooting

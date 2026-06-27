@@ -1,15 +1,8 @@
 import argparse
-import atexit
 import os
-import signal
-import subprocess
-import sys
-import tempfile
-import time
 from pathlib import Path
-from typing import List, Iterable, Optional, Tuple
+from typing import List, Optional, Tuple
 
-import requests
 from torch import Tensor
 from tqdm import tqdm
 
@@ -19,53 +12,14 @@ from src.data.dataset import DatasetConfig, RigDatasetModule
 from src.data.transform import Transform
 from src.model.tokenrig import TokenRigResult
 from src.tokenizer.parse import get_tokenizer
-from src.server.spec import (
-    BPY_SERVER,
-    get_model,
-    object_to_bytes,
-    bytes_to_object,
-)
+from src.server.spec import get_model
 from src.data.vertex_group import voxel_skin
 from src.paths import EXPERIMENTS_DIR
+from src.rig_package.parser.bpy import transfer_rigging
 
 MODEL_CKPTS = [
     str(EXPERIMENTS_DIR / "articulation_xl_quantization_256_token_4/grpo_1400.ckpt"),
 ]
-
-HF_PATHS = [
-    "None",
-]
-
-
-def start_bpy_server():
-    popen_kwargs = dict(
-        args=[sys.executable, "bpy_server.py"],
-        stdout=None,
-        stderr=None,
-    )
-    if os.name == "nt":
-        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-    else:
-        popen_kwargs["preexec_fn"] = os.setsid
-
-    proc = subprocess.Popen(**popen_kwargs)
-    print(f"[Main] bpy_server.py started (pid={proc.pid})")
-
-    def cleanup():
-        print(f"[Main] Terminating bpy_server.py (pid={proc.pid})")
-        try:
-            if proc.poll() is not None:
-                return
-            if os.name == "nt":
-                proc.terminate()
-            else:
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-
-    atexit.register(cleanup)
-    return proc
-
 
 model = None
 tokenizer = None
@@ -76,8 +30,6 @@ CURRENT_HF_PATH: Optional[str] = None
 
 def load_model(model_ckpt: str, hf_path: Optional[str], device: Optional[str] = None) -> Tuple[str, str]:
     global model, tokenizer, transform, CURRENT_MODEL_CKPT, CURRENT_HF_PATH
-    if hf_path == "None":
-        hf_path = None
     if model is not None and model_ckpt == CURRENT_MODEL_CKPT and hf_path == CURRENT_HF_PATH:
         return ("Model already loaded.", model_ckpt)
 
@@ -117,30 +69,6 @@ def map_output_path(
     return (output_root / rel).with_suffix(".glb")
 
 
-def post_bpy_payload(endpoint: str, payload):
-    payload_path = None
-    try:
-        with tempfile.NamedTemporaryFile(prefix=f"skintokens_{endpoint}_", suffix=".pt", delete=False) as f:
-            f.write(object_to_bytes(payload))
-            payload_path = f.name
-        request_payload = {"payload_path": payload_path}
-        response = requests.post(
-            f"{BPY_SERVER}/{endpoint}",
-            data=object_to_bytes(request_payload),
-        )
-        response.raise_for_status()
-        result = bytes_to_object(response.content)
-        if isinstance(result, dict) and result.get("error") is not None:
-            raise RuntimeError(result.get("traceback") or result["error"])
-        return result
-    finally:
-        if payload_path is not None:
-            try:
-                os.remove(payload_path)
-            except OSError:
-                pass
-
-
 def run_rig(
     filepaths: List[Path],
     top_k: int,
@@ -149,7 +77,6 @@ def run_rig(
     repetition_penalty: float,
     num_beams: int,
     use_skeleton: bool,
-    use_transfer: bool,
     use_postprocess: bool,
     output_paths: List[Path],
     model_ckpt: str,
@@ -161,15 +88,15 @@ def run_rig(
 
     datapath = {
         "data_name": None,
-        "loader": "bpy_server",
+        "loader": "bpy",
         "filepaths": {"articulation": [str(p) for p in filepaths]},
     }
 
     dataset_config = DatasetConfig.parse(
         shuffle=False,
         batch_size=1,
-        num_workers=1,
-        pin_memory=str(model.device).startswith("cuda"),
+        num_workers=0,
+        pin_memory=False,
         persistent_workers=False,
         datapath=datapath,
     ).split_by_cls()
@@ -237,26 +164,14 @@ def run_rig(
         out_path = output_paths[i]
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
-        if use_transfer:
-            payload = dict(
-                source_asset=asset,
-                target_path=asset.path,
-                export_path=str(out_path),
-                group_per_vertex=4,
-            )
-            res = post_bpy_payload("transfer", payload)
-        else:
-            payload = dict(
-                asset=asset,
-                filepath=str(out_path),
-                group_per_vertex=4,
-            )
-            res = post_bpy_payload("export", payload)
+        transfer_rigging(
+            source_asset=asset,
+            target_path=asset.path,
+            export_path=str(out_path),
+            group_per_vertex=4,
+        )
 
-        if res != "ok":
-            print(f"[Error] {res}")
-        else:
-            print(f"[OK] Exported: {out_path}")
+        print(f"[OK] Exported: {out_path}")
 
         results_out.append(out_path)
 
@@ -265,7 +180,11 @@ def run_rig(
 
 def run_cli(args):
     input_path = Path(args.input).resolve()
-    output_path = Path(args.output).resolve()
+    
+    if args.output:
+        output_path = Path(args.output).resolve()
+    else:
+        output_path = (Path("outputs") / f"{input_path.stem}_bind.glb").resolve()
 
     files = collect_files(input_path)
     if not files:
@@ -287,7 +206,6 @@ def run_cli(args):
         args.repetition_penalty,
         args.num_beams,
         args.use_skeleton,
-        args.use_transfer,
         args.use_postprocess,
         outputs,
         args.model_ckpt,
@@ -295,31 +213,18 @@ def run_cli(args):
     )
 
 
-def wait_for_bpy_server(timeout=30):
-    t0 = time.time()
-    while True:
-        try:
-            requests.get(f"{BPY_SERVER}/ping", timeout=1)
-            print("[Main] bpy_server is ready")
-            return
-        except Exception:
-            if time.time() - t0 > timeout:
-                raise RuntimeError("bpy_server failed to start")
-            time.sleep(0.5)
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("TokenRig Demo")
     parser.add_argument("--input", help="Input file or directory")
-    parser.add_argument("--output", help="Output file or directory")
+    parser.add_argument("--output", default=None, help="Output file or directory (default: outputs/{input_name}_bind.glb)")
 
-    parser.add_argument("--top_k", type=int, default=5)
-    parser.add_argument("--top_p", type=float, default=0.95)
-    parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--repetition_penalty", type=float, default=2.0)
-    parser.add_argument("--num_beams", type=int, default=10)
+    parser.add_argument("--top_k", type=int, default=1)
+    parser.add_argument("--top_p", type=float, default=1)
+    parser.add_argument("--temperature", type=float, default=0.1)
+    parser.add_argument("--repetition_penalty", type=float, default=1.0)
+    parser.add_argument("--num_beams", type=int, default=5)
 
     parser.add_argument("--use_skeleton", action="store_true")
-    parser.add_argument("--use_transfer", action="store_true")
     parser.add_argument("--use_postprocess", action="store_true")
 
     parser.add_argument("--model_ckpt", default=MODEL_CKPTS[0] if MODEL_CKPTS else "")
@@ -329,8 +234,5 @@ if __name__ == "__main__":
 
     if not args.input:
         parser.error("--input is required for CLI mode. Use serve.py for the HTTP API server.")
-
-    server_proc = start_bpy_server()
-    wait_for_bpy_server()
 
     run_cli(args)
