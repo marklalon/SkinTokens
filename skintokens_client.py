@@ -15,7 +15,6 @@ Requires the ``websockets`` package.
 """
 import argparse
 import asyncio
-import base64
 import json
 import os
 import sys
@@ -73,12 +72,19 @@ async def _run(args) -> None:
 
     ws_url = _websocket_url(args.server)
     with open(args.file, "rb") as f:
-        file_b64 = base64.b64encode(f.read()).decode("ascii")
+        file_data = f.read()
 
     filename = os.path.basename(args.file)
 
+    image_data = None
+    image_name = None
+    if args.image:
+        with open(args.image, "rb") as f:
+            image_data = f.read()
+        image_name = os.path.basename(args.image)
+        print(f"[client] image attached: {args.image} ({len(image_data)} bytes)")
+
     payload = {
-        "file_base64": file_b64,
         "filename": filename,
         "top_k": args.top_k,
         "top_p": args.top_p,
@@ -88,13 +94,10 @@ async def _run(args) -> None:
         "do_sample": True,
         "use_skeleton": args.use_skeleton,
         "use_postprocess": args.use_postprocess,
+        "image_size": len(image_data) if image_data else 0,
     }
-
-    if args.image:
-        with open(args.image, "rb") as f:
-            payload["image_base64"] = base64.b64encode(f.read()).decode("ascii")
-            payload["image_name"] = os.path.basename(args.image)
-        print(f"[client] image attached: {args.image}")
+    if image_name:
+        payload["image_name"] = image_name
 
     progress = ProgressDisplay()
     started_at = time.monotonic()
@@ -106,9 +109,23 @@ async def _run(args) -> None:
             open_timeout=args.timeout,
         ) as ws:
             await ws.send(json.dumps(payload))
+            await ws.send(file_data)
+            if image_data:
+                await ws.send(image_data)
 
             try:
                 async for raw_message in ws:
+                    # raw_message may be bytes (binary frame) or str (text frame)
+                    if isinstance(raw_message, bytes):
+                        # This is the GLB binary after "done" stage
+                        glb = raw_message
+                        output_dir = os.path.dirname(os.path.abspath(args.output))
+                        os.makedirs(output_dir, exist_ok=True)
+                        with open(args.output, "wb") as f:
+                            f.write(glb)
+                        print(f"[client] saved {len(glb)} bytes -> {args.output}")
+                        return
+
                     message = json.loads(raw_message)
                     stage = message.get("stage", "unknown")
 
@@ -126,20 +143,16 @@ async def _run(args) -> None:
                     elif stage == "done":
                         progress.update(100, "complete", message.get("elapsed_sec"))
                         progress.finish()
-                        glb = base64.b64decode(message["glb_base64"])
-                        output_dir = os.path.dirname(os.path.abspath(args.output))
-                        os.makedirs(output_dir, exist_ok=True)
-                        with open(args.output, "wb") as f:
-                            f.write(glb)
-                        print(f"[client] saved {len(glb)} bytes -> {args.output}")
+                        # Binary GLB frame follows the done message
                         renamer_meta = {k: v for k, v in message.items()
-                                         if k not in ("stage", "glb_base64",
+                                         if k not in ("stage", "glb_size",
                                                       "elapsed_sec", "progress",
                                                       "request_id")}
                         if renamer_meta:
                             for k, v in renamer_meta.items():
                                 print(f"[client] {k}: {v}")
-                        return
+                        # Continue loop to receive the binary frame
+                        continue
                     elif stage == "cancelled":
                         raise asyncio.CancelledError(message.get("message"))
                     elif stage == "error":

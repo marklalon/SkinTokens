@@ -32,7 +32,6 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import argparse
 import asyncio
 import atexit
-import base64
 import json
 import logging
 import signal
@@ -359,7 +358,7 @@ def _run_generation(
     request_id: str,
     cancellation: CancellationToken,
     progress_callback=None,
-    image_base64: str | None = None,
+    image_data: bytes | None = None,
     image_name: str | None = None,
 ) -> bytes:
     """Run the full rigging pipeline and return GLB bytes."""
@@ -507,7 +506,7 @@ def _run_generation(
                 file_name=filename,
                 conf_thresh=0.8,
                 request_id=request_id,
-                image_base64=image_base64,
+                image_data=image_data,
                 image_name=image_name,
             )
 
@@ -531,17 +530,16 @@ def _run_skeleton_rename(
     file_name: str,
     conf_thresh: float,
     request_id: str,
-    image_base64: str | None = None,
+    image_data: bytes | None = None,
     image_name: str | None = None,
 ) -> bytes:
     """Send GLB data to the remote skeleton renamer service via WebSocket and
     return the renamed GLB bytes.
 
-    If ``image_base64`` / ``image_name`` are provided they are forwarded to the
+    If ``image_data`` / ``image_name`` are provided they are forwarded to the
     renamer for LLM-based species/skeleton verification.
     """
     import asyncio as _asyncio
-    import base64 as _base64
     import json as _json
 
     ws_url = SKELETON_RENAMER_URL.rstrip("/")
@@ -555,14 +553,13 @@ def _run_skeleton_rename(
 
     async def _rename():
         import websockets as _ws
-        input_b64 = _base64.b64encode(glb_data).decode("ascii")
+        image_size = len(image_data) if image_data else 0
         payload_dict: dict = {
-            "input_file_base64": input_b64,
             "file_name": file_name,
             "conf_thresh": conf_thresh,
+            "image_size": image_size,
         }
-        if image_base64 and image_name:
-            payload_dict["image_base64"] = image_base64
+        if image_data and image_name:
             payload_dict["image_name"] = image_name
         payload = _json.dumps(payload_dict)
         async with _ws.connect(
@@ -571,16 +568,22 @@ def _run_skeleton_rename(
             open_timeout=30,
         ) as ws:
             await ws.send(payload)
+            await ws.send(glb_data)
+            if image_data:
+                await ws.send(image_data)
             async for raw_message in ws:
                 message = _json.loads(raw_message)
                 stage = message.get("stage", "unknown")
                 if stage == "done":
-                    glb_b64 = message.get("glb_base64", "")
-                    if not glb_b64:
-                        raise RuntimeError("renamer returned done without glb_base64")
+                    glb_size = message.get("glb_size", 0)
+                    if not glb_size:
+                        raise RuntimeError("renamer returned done without glb_size")
+                    renamed_bytes = await ws.recv()
+                    if isinstance(renamed_bytes, str):
+                        renamed_bytes = renamed_bytes.encode()
                     renamer_meta = {k: v for k, v in message.items()
-                                    if k not in ("stage", "glb_base64")}
-                    return _base64.b64decode(glb_b64), renamer_meta
+                                    if k not in ("stage", "glb_size")}
+                    return renamed_bytes, renamer_meta
                 elif stage == "error":
                     raise RuntimeError(message.get("message", "unknown renamer error"))
                 elif stage == "cancelled":
@@ -666,7 +669,7 @@ async def _generate(
     request_id: str,
     progress_callback=None,
     cancellation: Optional[CancellationToken] = None,
-    image_base64: str | None = None,
+    image_data: bytes | None = None,
     image_name: str | None = None,
 ):
     """Run generation with lock serialization.
@@ -690,7 +693,7 @@ async def _generate(
         try:
             glb, renamer_meta = await _to_thread_cancellable(
                 _run_generation, file_data, filename, params, request_id,
-                cancellation, reporter.report, image_base64, image_name,
+                cancellation, reporter.report, image_data, image_name,
                 cancellation=cancellation,
             )
         finally:
@@ -760,10 +763,13 @@ async def health():
 async def ws_generate(ws: WebSocket):
     """
     WebSocket protocol:
-      client -> {"file_base64": "...", "filename": "model.obj", ...params}
+      client -> {"filename": "model.obj", "image_name": "...", "image_size": N, ...params}
+      client -> <binary: file data>
+      client -> <binary: image data>   (only if image_size > 0)
       client -> {"type": "cancel"}
       server -> {"stage": "queued"|"processing"|"done"|"cancelled"|"error", ...}
-      final  -> {"stage": "done", "glb_base64": "..."}
+      server -> {"stage": "done", "glb_size": N, ...}
+      server -> <binary: GLB data>
     """
     request_id = uuid.uuid4().hex[:8]
     cancellation = None
@@ -783,18 +789,23 @@ async def ws_generate(ws: WebSocket):
             await ws.close()
             return
 
+        filename = req.pop("filename", "input.obj")
+        image_name: str | None = req.pop("image_name", None)
+        image_size: int = req.pop("image_size", 0)
+
+        # Receive binary file data
         try:
-            file_data = base64.b64decode(req.pop("file_base64"), validate=True)
-            filename = req.pop("filename", "input.obj")
+            file_data = await ws.receive_bytes()
         except Exception as e:
             logger.warning("[%s] invalid file: %s", request_id, e)
             await ws.send_json({"stage": "error", "message": f"invalid file: {e}"})
             await ws.close()
             return
 
-        # Extract optional image for skeleton-renamer
-        image_base64: str | None = req.pop("image_base64", None)
-        image_name: str | None = req.pop("image_name", None)
+        # Receive optional image for skeleton-renamer
+        image_data: bytes | None = None
+        if image_size > 0:
+            image_data = await ws.receive_bytes()
 
         params = GenParams(
             **{k: v for k, v in req.items() if k in GenParams.model_fields}
@@ -833,7 +844,7 @@ async def ws_generate(ws: WebSocket):
             _generate(
                 file_data, filename, params, request_id, send_progress,
                 cancellation=cancellation,
-                image_base64=image_base64, image_name=image_name,
+                image_data=image_data, image_name=image_name,
             )
         )
         receiver_task = asyncio.create_task(
@@ -873,10 +884,11 @@ async def ws_generate(ws: WebSocket):
             "elapsed_sec": round(time.time() - t0, 2),
             "progress": 100,
             "request_id": request_id,
-            "glb_base64": base64.b64encode(glb).decode("ascii"),
+            "glb_size": len(glb),
         }
         done_msg.update(renamer_meta)
         await ws.send_json(done_msg)
+        await ws.send_bytes(glb)
         logger.info("[%s] WebSocket request completed bytes=%d elapsed=%.2fs meta=%s",
                     request_id, len(glb), time.time() - t0,
                     json.dumps(renamer_meta, ensure_ascii=False)[:200])
