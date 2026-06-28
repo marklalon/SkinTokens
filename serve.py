@@ -339,8 +339,6 @@ def _run_generation(
     request_id: str,
     cancellation: CancellationToken,
     progress_callback=None,
-    image_data: bytes | None = None,
-    image_name: str | None = None,
 ) -> list[tuple[bytes, dict]]:
     """Run the full rigging pipeline and return a list of (glb_bytes, renamer_meta) tuples,
     one per sample (controlled by num_samples in GenParams)."""
@@ -476,6 +474,9 @@ def _run_generation(
                 elif phase == "exported":
                     step = f"exported {sample_label}"
                     percent = min(mid, done - 1)
+                elif phase == "renaming":
+                    step = f"renaming {sample_label}"
+                    percent = base + round((done - base) * 0.9)
                 elif phase == "complete":
                     step = f"finished {sample_label}"
                     percent = done
@@ -531,13 +532,12 @@ def _run_generation(
                     logger.info("[%s] sample=%d skipping skeleton renamer", request_id, sample_idx)
                     all_glbs.append((glb_data, {}))
                 else:
+                    report_sample_progress(sample_idx, "renaming")
                     renamed_data, renamer_meta = _run_skeleton_rename(
                         glb_data,
                         file_name=filename,
                         conf_thresh=0.8,
                         request_id=request_id,
-                        image_data=image_data,
-                        image_name=image_name,
                     )
                     all_glbs.append((renamed_data, renamer_meta))
                 report_sample_progress(sample_idx, "complete")
@@ -562,14 +562,9 @@ def _run_skeleton_rename(
     file_name: str,
     conf_thresh: float,
     request_id: str,
-    image_data: bytes | None = None,
-    image_name: str | None = None,
-) -> bytes:
+) -> tuple[bytes, dict]:
     """Send GLB data to the remote skeleton renamer service via WebSocket and
     return the renamed GLB bytes.
-
-    If ``image_data`` / ``image_name`` are provided they are forwarded to the
-    renamer for LLM-based species/skeleton verification.
     """
     import asyncio as _asyncio
     import json as _json
@@ -585,14 +580,10 @@ def _run_skeleton_rename(
 
     async def _rename():
         import websockets as _ws
-        image_size = len(image_data) if image_data else 0
         payload_dict: dict = {
             "file_name": file_name,
             "conf_thresh": conf_thresh,
-            "image_size": image_size,
         }
-        if image_data and image_name:
-            payload_dict["image_name"] = image_name
         payload = _json.dumps(payload_dict)
         async with _ws.connect(
             ws_url,
@@ -601,8 +592,6 @@ def _run_skeleton_rename(
         ) as ws:
             await ws.send(payload)
             await ws.send(glb_data)
-            if image_data:
-                await ws.send(image_data)
             async for raw_message in ws:
                 message = _json.loads(raw_message)
                 stage = message.get("stage", "unknown")
@@ -622,12 +611,10 @@ def _run_skeleton_rename(
                     raise RuntimeError(f"renamer cancelled: {message.get('message', '')}")
             raise RuntimeError("WebSocket closed before renamer result")
 
-    logger.info("[%s] calling skeleton renamer at %s (file=%s, conf_thresh=%.2f, image=%s)",
-                request_id, ws_url, file_name, conf_thresh,
-                image_name if image_name else "none")
+    logger.info("[%s] calling skeleton renamer at %s (file=%s, conf_thresh=%.2f)",
+                request_id, ws_url, file_name, conf_thresh)
     try:
         renamed, renamer_meta = _asyncio.run(_rename())
-        logger.info("[%s] skeleton rename done", request_id)
         return renamed, renamer_meta
     except Exception:
         logger.error("[%s] skeleton renamer failed", request_id)
@@ -675,8 +662,6 @@ async def _generate(
     request_id: str,
     progress_callback=None,
     cancellation: Optional[CancellationToken] = None,
-    image_data: bytes | None = None,
-    image_name: str | None = None,
 ):
     """Run generation with lock serialization.
 
@@ -699,7 +684,7 @@ async def _generate(
         try:
             results = await _to_thread_cancellable(
                 _run_generation, file_data, filename, params, request_id,
-                cancellation, reporter.report, image_data, image_name,
+                cancellation, reporter.report,
                 cancellation=cancellation,
             )
         finally:
@@ -766,9 +751,8 @@ async def health():
 async def ws_generate(ws: WebSocket):
     """
     WebSocket protocol:
-      client -> {"filename": "model.obj", "image_name": "...", "image_size": N, ...params}
+      client -> {"filename": "model.obj", ...params}
       client -> <binary: file data>
-      client -> <binary: image data>   (only if image_size > 0)
       client -> {"type": "cancel"}
       server -> {"stage": "queued"|"processing"|"done"|"cancelled"|"error", ...}
       server -> {"stage": "done", "glb_size": N, ...}
@@ -793,8 +777,6 @@ async def ws_generate(ws: WebSocket):
             return
 
         filename = req.pop("filename", "input.obj")
-        image_name: str | None = req.pop("image_name", None)
-        image_size: int = req.pop("image_size", 0)
 
         # Receive binary file data
         try:
@@ -806,16 +788,11 @@ async def ws_generate(ws: WebSocket):
             return
 
         # Receive optional image for skeleton-renamer
-        image_data: bytes | None = None
-        if image_size > 0:
-            image_data = await ws.receive_bytes()
-
         params = GenParams(
             **{k: v for k, v in req.items() if k in GenParams.model_fields}
         )
-        logger.info("[%s] file decoded bytes=%d filename=%s params=%s image=%s",
-                    request_id, len(file_data), filename, params.model_dump(),
-                    image_name if image_name else "none")
+        logger.info("[%s] file decoded bytes=%d filename=%s params=%s",
+                    request_id, len(file_data), filename, params.model_dump())
 
         loop = asyncio.get_running_loop()
         cancellation = CancellationToken()
@@ -847,7 +824,6 @@ async def ws_generate(ws: WebSocket):
             _generate(
                 file_data, filename, params, request_id, send_progress,
                 cancellation=cancellation,
-                image_data=image_data, image_name=image_name,
             )
         )
         receiver_task = asyncio.create_task(

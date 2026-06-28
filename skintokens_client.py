@@ -1,15 +1,9 @@
 """SkinTokens / TokenRig WebSocket client — stream progress and save a rigged GLB.
 
 Example:
-    python skintokens_client.py --file assets/character.obj --output out.glb
-    python skintokens_client.py --file model.fbx --server http://HOST:8087 \
+    python skintokens_client.py --input assets/character.obj --output out.glb
+    python skintokens_client.py --input model.fbx --server http://HOST:8087 \
         --use-skeleton --use-postprocess
-    python skintokens_client.py --file model.fbx --image char.png \
-        --server http://HOST:8087
-
-When ``--image`` is provided, a character reference image is sent through to the
-skeleton-renamer service (``SKINTOKENS_SKELETON_RENAMER_URL``) for LLM-based
-species/skeleton verification.
 
 Requires the ``websockets`` package.
 """
@@ -79,18 +73,10 @@ async def _run(args) -> None:
         ) from exc
 
     ws_url = _websocket_url(args.server)
-    with open(args.file, "rb") as f:
+    with open(args.input, "rb") as f:
         file_data = f.read()
 
-    filename = os.path.basename(args.file)
-
-    image_data = None
-    image_name = None
-    if args.image:
-        with open(args.image, "rb") as f:
-            image_data = f.read()
-        image_name = os.path.basename(args.image)
-        print(f"[client] image attached: {args.image} ({len(image_data)} bytes)")
+    filename = os.path.basename(args.input)
 
     payload = {
         "filename": filename,
@@ -105,10 +91,7 @@ async def _run(args) -> None:
         "use_skeleton": args.use_skeleton,
         "use_postprocess": args.use_postprocess,
         "skip_renamer": args.skip_renamer,
-        "image_size": len(image_data) if image_data else 0,
     }
-    if image_name:
-        payload["image_name"] = image_name
 
     progress = ProgressDisplay()
     started_at = time.monotonic()
@@ -121,8 +104,6 @@ async def _run(args) -> None:
         ) as ws:
             await ws.send(json.dumps(payload))
             await ws.send(file_data)
-            if image_data:
-                await ws.send(image_data)
 
             glb_count = 0
             expected_samples = args.num_samples
@@ -196,10 +177,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="SkinTokens / TokenRig WebSocket client with live progress"
     )
-    parser.add_argument("--file", required=True, help="Input 3D file path (OBJ/FBX/GLB)")
-    parser.add_argument("--image", default=None,
-                        help="Character reference image (PNG/JPEG) forwarded to skeleton-renamer "
-                             "for LLM-based species/skeleton verification")
+    parser.add_argument("--input", required=True, help="Input 3D file path (OBJ/FBX/GLB)")
     parser.add_argument(
         "--output",
         default=None,
@@ -223,7 +201,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.output is None:
-        input_name = os.path.splitext(os.path.basename(args.file))[0]
+        input_name = os.path.splitext(os.path.basename(args.input))[0]
         args.output = f"outputs/{input_name}_skined.glb"
 
     try:

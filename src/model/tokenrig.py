@@ -390,7 +390,7 @@ class TokenRig(ModelSpec):
             **gen_kwargs,
         )
         if progress_callback is not None:
-            progress_callback(74, f"exporting sample...")
+            progress_callback(74, f"preparing for export...")
 
         outputs: List[TokenRigResult] = []
         for i in range(num_samples):
