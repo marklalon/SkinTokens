@@ -33,6 +33,8 @@ import argparse
 import asyncio
 import json
 import logging
+import numpy as np
+import random
 import sys
 import tempfile
 import threading
@@ -274,8 +276,9 @@ class GenParams(BaseModel):
     top_p: float = 1.0
     temperature: float = 0.1
     repetition_penalty: float = 1.0
-    num_beams: int = 5
-    num_samples: int = Field(default=1, ge=1)
+    num_beams: int = Field(default=10, ge=1, le=16)
+    num_samples: int = Field(default=1, ge=1, le=8)
+    seed: int | None = None
     use_skeleton: bool = False
     use_postprocess: bool = False
     skip_renamer: bool = False
@@ -414,6 +417,11 @@ def _run_generation(
                 batch.pop("skeleton_tokens", None)
                 batch.pop("skeleton_mask", None)
 
+            if params.seed is not None:
+                torch.manual_seed(params.seed)
+                torch.cuda.manual_seed_all(params.seed)
+                np.random.seed(params.seed)
+                random.seed(params.seed)
             batch["generate_kwargs"] = dict(
                 max_new_tokens=2048,
                 top_k=params.top_k,
@@ -481,6 +489,14 @@ def _run_generation(
 
                 asset = pred.asset
                 assert asset is not None
+                collapsed_joints = asset.collapse_near_parent_joints()
+                if collapsed_joints:
+                    logger.info(
+                        "[%s] sample=%d collapsed near-parent skeleton joints: %s",
+                        request_id,
+                        sample_idx,
+                        ", ".join(collapsed_joints),
+                    )
 
                 if params.use_postprocess:
                     voxel = asset.voxel(resolution=196)

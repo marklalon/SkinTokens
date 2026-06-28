@@ -100,6 +100,7 @@ async def _run(args) -> None:
         "repetition_penalty": args.repetition_penalty,
         "num_beams": args.num_beams,
         "num_samples": args.num_samples,
+        "seed": args.seed,
         "do_sample": True,
         "use_skeleton": args.use_skeleton,
         "use_postprocess": args.use_postprocess,
@@ -210,8 +211,9 @@ def main() -> None:
     parser.add_argument("--top-p", type=float, default=1.0, help="Top-p sampling (default: 1.0)")
     parser.add_argument("--temperature", type=float, default=0.1, help="Temperature (default: 0.1)")
     parser.add_argument("--repetition-penalty", type=float, default=1.0, help="Repetition penalty (default: 1.0)")
-    parser.add_argument("--num-beams", type=int, default=5, help="Number of beams (default: 5)")
-    parser.add_argument("--num-samples", type=int, default=1, help="Number of parallel samples to generate (default: 1)")
+    parser.add_argument("--num-beams", type=int, default=10, help="Number of beams (1-16, default: 10)")
+    parser.add_argument("--num-samples", type=int, default=1, help="Number of parallel samples to generate (1-8, default: 1)")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducible generation")
 
     parser.add_argument("--use-skeleton", action="store_true", help="Use skeleton for skin generation")
     parser.add_argument("--use-postprocess", action="store_true", help="Use postprocess (voxel skin)")

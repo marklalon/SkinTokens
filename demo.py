@@ -147,6 +147,9 @@ def run_rig(
 
         asset = preds[0].asset
         assert asset is not None
+        collapsed_joints = asset.collapse_near_parent_joints()
+        if collapsed_joints:
+            print(f"[postprocess] Collapsed near-parent joints: {', '.join(collapsed_joints)}")
 
         if use_postprocess:
             voxel = asset.voxel(resolution=196)
