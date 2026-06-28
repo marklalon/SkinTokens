@@ -9,13 +9,6 @@ import torch
 from ..rig_package.info.asset import Asset
 from ..model.tokenrig import TokenRig
 
-PORT = 59875
-SERVER = f"http://localhost:{PORT}"
-TMP_CKPT_DIR = "./tmp_ckpt"
-
-BPY_PORT = 59876
-BPY_SERVER = f"http://localhost:{BPY_PORT}"
-
 @dataclass
 class TensorPacket:
     """make sure stays on cpu"""

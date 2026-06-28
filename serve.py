@@ -31,17 +31,21 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import argparse
 import asyncio
-import atexit
 import json
 import logging
-import signal
-import subprocess
 import sys
 import tempfile
 import threading
 import time
 import uuid
-from contextlib import asynccontextmanager, suppress
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import (
+    asynccontextmanager,
+    contextmanager,
+    redirect_stderr,
+    redirect_stdout,
+    suppress,
+)
 from pathlib import Path
 from typing import List, Optional
 
@@ -115,6 +119,37 @@ def _run_startup_stage(label: str, operation):
     return result
 
 
+@contextmanager
+def _suppress_bpy_output():
+    """Silence Blender/bpy stdout, stderr, and addon logging during bpy calls."""
+    previous_disable = logging.root.manager.disable
+    redirected_fds: list[tuple[int, int | None]] = []
+
+    with open(os.devnull, "w", encoding="utf-8") as devnull:
+        try:
+            for fd, stream in ((1, sys.stdout), (2, sys.stderr)):
+                with suppress(Exception):
+                    stream.flush()
+                try:
+                    saved_fd = os.dup(fd)
+                except OSError:
+                    saved_fd = None
+                else:
+                    os.dup2(devnull.fileno(), fd)
+                redirected_fds.append((fd, saved_fd))
+
+            with redirect_stdout(devnull), redirect_stderr(devnull):
+                logging.disable(logging.CRITICAL)
+                yield
+        finally:
+            logging.disable(previous_disable)
+            for fd, saved_fd in reversed(redirected_fds):
+                if saved_fd is None:
+                    continue
+                os.dup2(saved_fd, fd)
+                os.close(saved_fd)
+
+
 # --------------------------------------------------------------------------- #
 # Global state
 # --------------------------------------------------------------------------- #
@@ -122,7 +157,7 @@ class ServerState:
     model = None
     tokenizer = None
     transform = None
-    bpy_proc: Optional[subprocess.Popen] = None
+    generation_executor: Optional[ThreadPoolExecutor] = None
     ready: bool = False
     loaded_at: float = 0.0
     busy: bool = False
@@ -212,7 +247,8 @@ async def _acquire_or_cancel(lock: asyncio.Lock, cancellation: CancellationToken
 
 async def _to_thread_cancellable(operation, *args, cancellation: CancellationToken):
     """Keep a lock held until cancelled worker code has really stopped."""
-    worker = asyncio.create_task(asyncio.to_thread(operation, *args))
+    loop = asyncio.get_running_loop()
+    worker = loop.run_in_executor(state.generation_executor, operation, *args)
     try:
         return await asyncio.shield(worker)
     except asyncio.CancelledError:
@@ -241,90 +277,36 @@ class GenParams(BaseModel):
     num_beams: int = 5
     use_skeleton: bool = False
     use_postprocess: bool = False
+    skip_renamer: bool = False
 
 
 # --------------------------------------------------------------------------- #
 # Pipeline loading
 # --------------------------------------------------------------------------- #
-def _start_bpy_server():
-    """Start the Blender Python server subprocess."""
-    popen_kwargs = dict(
-        args=[sys.executable, "bpy_server.py"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    if os.name == "nt":
-        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-    else:
-        popen_kwargs["preexec_fn"] = os.setsid
-
-    proc = subprocess.Popen(**popen_kwargs)
-    logger.info("bpy_server.py started (pid=%d)", proc.pid)
-
-    def cleanup():
-        logger.info("Terminating bpy_server.py (pid=%d)", proc.pid)
-        try:
-            if proc.poll() is not None:
-                return
-            if os.name == "nt":
-                proc.terminate()
-            else:
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-
-    atexit.register(cleanup)
-    return proc
-
-
-def _wait_for_bpy_server(timeout: float = 30):
-    """Wait until the bpy_server is ready to accept requests."""
-    import requests
-    from src.server.spec import BPY_SERVER
-
-    t0 = time.time()
-    while True:
-        try:
-            requests.get(f"{BPY_SERVER}/ping", timeout=1)
-            logger.info("bpy_server is ready")
-            return
-        except Exception:
-            if time.time() - t0 > timeout:
-                raise RuntimeError("bpy_server failed to start within timeout")
-            time.sleep(0.5)
+def _load_bpy_inproc():
+    """Import bpy-backed parser on the dedicated generation thread."""
+    with _suppress_bpy_output():
+        from src.rig_package.parser.bpy import BpyParser  # noqa: F401
 
 
 def _load_pipeline():
-    """Load the model pipeline and start the bpy_server.
-
-    The bpy_server and the model are loaded in parallel.  The bpy_server
-    is started first (fast subprocess fork), but we do not wait for it to
-    become healthy until after the model has also been loaded.  This
-    overlaps the ~4 s Blender startup with the ~10 s model load.
-    """
+    """Load the model pipeline and initialize the bpy runtime."""
     from src.data.transform import Transform
     from src.tokenizer.parse import get_tokenizer
     from src.server.spec import get_model
 
-    # 1. Start bpy_server subprocess (fast — just a fork)
-    state.bpy_proc = _run_startup_stage("starting bpy_server", _start_bpy_server)
+    if state.generation_executor is None:
+        state.generation_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="skintokens-gen",
+        )
 
-    # 2. Kick off bpy_server readiness check in a background thread so it
-    #    runs concurrently with model loading.
-    bpy_error: list[Exception | None] = [None]
+    def load_bpy_fn():
+        assert state.generation_executor is not None
+        state.generation_executor.submit(_load_bpy_inproc).result()
 
-    def _wait_for_bpy_bg():
-        try:
-            _wait_for_bpy_server()
-        except Exception as exc:
-            bpy_error[0] = exc
-        finally:
-            pass  # thread exits, join() handles synchronization
+    _run_startup_stage("initializing geometry runtime", load_bpy_fn)
 
-    bpy_thread = threading.Thread(target=_wait_for_bpy_bg, daemon=True)
-    bpy_thread.start()
-
-    # 3. Load model (this dominates startup time)
     def load_model_fn():
         model = get_model(MODEL_CKPT, hf_path=HF_PATH, device=DEVICE)
         tokenizer = get_tokenizer(**model.tokenizer_config)
@@ -334,11 +316,6 @@ def _load_pipeline():
     model, tokenizer, transform = _run_startup_stage(
         f"loading model from {MODEL_CKPT}", load_model_fn
     )
-
-    # 4. Wait for bpy_server readiness (should already be done by now)
-    bpy_thread.join()
-    if bpy_error[0] is not None:
-        raise bpy_error[0]
 
     state.model = model
     state.tokenizer = tokenizer
@@ -366,9 +343,7 @@ def _run_generation(
     from torch import Tensor
     from src.data.dataset import DatasetConfig, RigDatasetModule
     from src.model.tokenrig import TokenRigResult
-    from src.server.spec import BPY_SERVER, object_to_bytes, bytes_to_object
     from src.data.vertex_group import voxel_skin
-    import requests as req_lib
 
     cancellation.raise_if_cancelled()
 
@@ -391,14 +366,14 @@ def _run_generation(
 
         datapath = {
             "data_name": None,
-            "loader": "bpy_server",
+            "loader": "bpy",
             "filepaths": {"articulation": [str(input_path)]},
         }
 
         dataset_config = DatasetConfig.parse(
             shuffle=False,
             batch_size=1,
-            num_workers=1,
+            num_workers=0,
             pin_memory=DEVICE.startswith("cuda"),
             persistent_workers=False,
             datapath=datapath,
@@ -411,13 +386,24 @@ def _run_generation(
             process_fn=state.model._process_fn,
         )
 
-        dataloader = module.predict_dataloader()["articulation"]
+        with _suppress_bpy_output():
+            dataloader = module.predict_dataloader()["articulation"]
         cancellation.raise_if_cancelled()
 
         if progress_callback:
             progress_callback(10, "running inference")
 
-        for batch in dataloader:
+        batch_iterator = iter(dataloader)
+        while True:
+            with _suppress_bpy_output():
+                try:
+                    batch = next(batch_iterator)
+                except StopIteration:
+                    batch = None
+
+            if batch is None:
+                break
+
             batch = {
                 k: v.to(state.model.device, non_blocking=True) if isinstance(v, Tensor) else v
                 for k, v in batch.items()
@@ -476,39 +462,39 @@ def _run_generation(
                 asset.normalize_skin()
 
             if progress_callback:
-                progress_callback(75, "exporting GLB via bpy")
+                progress_callback(75, "exporting GLB")
 
             out_path.parent.mkdir(parents=True, exist_ok=True)
 
-            payload = dict(
-                source_asset=asset,
-                target_path=asset.path,
-                export_path=str(out_path),
-                group_per_vertex=4,
-                auto_ground=True,
-            )
-            res = _post_bpy_payload("transfer", payload)
+            from src.rig_package.parser.bpy import transfer_rigging
 
-            cancellation.raise_if_cancelled()
-
-            if res != "ok":
-                raise RuntimeError(f"bpy export failed: {res}")
-
-            if progress_callback:
-                progress_callback(95, "reading output")
+            with _suppress_bpy_output():
+                transfer_rigging(
+                    source_asset=asset,
+                    target_path=asset.path,
+                    export_path=str(out_path),
+                    group_per_vertex=4,
+                    auto_ground=True,
+                )
 
             glb_data = out_path.read_bytes()
 
-            if progress_callback:
-                progress_callback(96, "skeleton rename")
-            glb_data, renamer_meta = _run_skeleton_rename(
-                glb_data,
-                file_name=filename,
-                conf_thresh=0.8,
-                request_id=request_id,
-                image_data=image_data,
-                image_name=image_name,
-            )
+            cancellation.raise_if_cancelled()
+
+            if params.skip_renamer:
+                logger.info("[%s] skipping skeleton renamer (requested by client)", request_id)
+                renamer_meta = {}
+            else:
+                if progress_callback:
+                    progress_callback(96, "starting skeleton rename")
+                glb_data, renamer_meta = _run_skeleton_rename(
+                    glb_data,
+                    file_name=filename,
+                    conf_thresh=0.8,
+                    request_id=request_id,
+                    image_data=image_data,
+                    image_name=image_name,
+                )
 
             if progress_callback:
                 progress_callback(100, "complete")
@@ -595,44 +581,11 @@ def _run_skeleton_rename(
                 image_name if image_name else "none")
     try:
         renamed, renamer_meta = _asyncio.run(_rename())
-        logger.info("[%s] skeleton rename done: %d bytes -> %d bytes  meta=%s",
-                    request_id, len(glb_data), len(renamed),
-                    _json.dumps(renamer_meta, ensure_ascii=False)[:200])
+        logger.info("[%s] skeleton rename done", request_id)
         return renamed, renamer_meta
     except Exception:
         logger.error("[%s] skeleton renamer failed", request_id)
         raise
-
-
-def _post_bpy_payload(endpoint: str, payload):
-    """Send a payload to the bpy_server and return the result."""
-    import requests as req_lib
-    from src.server.spec import BPY_SERVER, object_to_bytes, bytes_to_object
-
-    payload_path = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            prefix=f"skintokens_{endpoint}_", suffix=".pt", delete=False
-        ) as f:
-            serialized = object_to_bytes(payload)
-            f.write(serialized)
-            payload_path = f.name
-        request_payload = {"payload_path": payload_path}
-        response = req_lib.post(
-            f"{BPY_SERVER}/{endpoint}",
-            data=object_to_bytes(request_payload),
-        )
-        response.raise_for_status()
-        result = bytes_to_object(response.content)
-        if isinstance(result, dict) and result.get("error") is not None:
-            raise RuntimeError(result.get("traceback") or result["error"])
-        return result
-    finally:
-        if payload_path is not None:
-            try:
-                os.remove(payload_path)
-            except OSError:
-                pass
 
 
 class ProgressReporter:
@@ -739,12 +692,9 @@ async def lifespan(app: FastAPI):
         state.tokenizer = None
         state.transform = None
         state.ready = False
-        if state.bpy_proc is not None and state.bpy_proc.poll() is None:
-            logger.info("Shutting down bpy_server")
-            if os.name == "nt":
-                state.bpy_proc.terminate()
-            else:
-                os.killpg(os.getpgid(state.bpy_proc.pid), signal.SIGTERM)
+        if state.generation_executor is not None:
+            state.generation_executor.shutdown(wait=False, cancel_futures=True)
+            state.generation_executor = None
         torch.cuda.empty_cache()
 
 

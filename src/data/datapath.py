@@ -6,11 +6,9 @@ from random import shuffle
 from typing import Dict, List, Optional
 
 import numpy as np
-import requests
 import os
 
 from ..rig_package.info.asset import Asset
-from ..server.spec import BPY_SERVER, bytes_to_object, object_to_bytes
 from .spec import ConfigSpec
 
 @dataclass
@@ -34,20 +32,7 @@ class BpyLazyAsset(LazyAsset):
         asset.path = self.path
         return asset
 
-@dataclass
-class BpyServerLazyAsset(LazyAsset):
-    """workaround while bpy is working in multiple threads"""
-    def load(self) -> 'Asset':
-        try:
-            asset = bytes_to_object(requests.get(f"{BPY_SERVER}/load", data=object_to_bytes(self.path)).content)
-            if isinstance(asset, str):
-                raise RuntimeError(f"bpy server failed: {asset}")
-            assert isinstance(asset, Asset)
-            asset.cls = self.cls
-            asset.path = self.path
-            return asset
-        except Exception as e:
-            raise RuntimeError(f"bpy server failed: {str(e)}")
+
 
 @dataclass
 class NpzLazyAsset(LazyAsset):
@@ -165,7 +150,6 @@ class Datapath(ConfigSpec):
         MAP = {
             None: BpyLazyAsset,
             'bpy': BpyLazyAsset,
-            'bpy_server': BpyServerLazyAsset,
             'npz': NpzLazyAsset,
             'unirig': UniRigLazyAsset,
         }

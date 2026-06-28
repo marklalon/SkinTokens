@@ -73,6 +73,38 @@ class BpyParser(AbstractParser):
             armature_name=armature_name,
             skin=mesh_dict['skin'],
         )
+
+    @classmethod
+    def load_for_transfer(cls, filepath: str, **kwargs) -> Asset:
+        clean_bpy()
+        load(filepath=filepath, **kwargs)
+        collection = bpy.data.collections.get("glTF_not_exported")
+        if collection is not None:
+            for obj in list(collection.objects):
+                bpy.data.objects.remove(obj, do_unlink=True)
+
+        armature = get_armature()
+        if armature is None:
+            matrix_world = np.eye(4)
+        else:
+            matrix_world = np.array(armature.matrix_world)
+            obj = armature.parent
+            while obj is not None:
+                matrix_world = np.array(obj.matrix_world) @ matrix_world
+                obj = obj.parent
+
+        mesh_dict = extract_mesh(
+            bones=None,
+            include_faces=False,
+            include_normals=False,
+            include_skin=False,
+        )
+        return Asset(
+            vertices=mesh_dict['vertices'],
+            vertex_bias=mesh_dict['vertex_bias'],
+            mesh_names=mesh_dict['mesh_names'],
+            matrix_world=matrix_world,
+        )
     
     @classmethod
     def export(cls, asset: Asset, filepath: str, **kwargs):
@@ -298,7 +330,12 @@ def get_armature():
         return None
     return armatures[0]
 
-def extract_mesh(bones=None):
+def extract_mesh(
+    bones=None,
+    include_faces: bool=True,
+    include_normals: bool=True,
+    include_skin: bool=True,
+):
     """
     Extract vertices, face_normals, faces and skinning(if possible).
     """
@@ -308,7 +345,7 @@ def extract_mesh(bones=None):
             meshes.append(v)
     
     index = {}
-    if bones is not None:
+    if include_skin and bones is not None:
         for (id, pbone) in enumerate(bones):
             index[pbone.name] = id
         total_bones = len(bones)
@@ -333,57 +370,60 @@ def extract_mesh(bones=None):
         matrix_world_bias = m[:3, 3]
         rot = matrix_world_rot
         total_vertices = len(obj.data.vertices)
-        vertices = np.zeros((3, total_vertices))
+        vertices = np.zeros((3, total_vertices), dtype=np.float32)
         if total_bones is not None:
-            skin_weight = np.zeros((total_vertices, total_bones))
+            skin_weight = np.zeros((total_vertices, total_bones), dtype=np.float32)
         else:
-            skin_weight = np.zeros((1, 1))
+            skin_weight = np.zeros((1, 1), dtype=np.float32)
         obj_verts = obj.data.vertices
         obj_group_names = [g.name for g in obj.vertex_groups]
         faces = []
         normals = []
-        
-        for polygon in obj.data.polygons:
-            edges = polygon.edge_keys
-            nodes = []
-            adj = {}
-            for edge in edges:
-                if adj.get(edge[0]) is None:
-                    adj[edge[0]] = []
-                adj[edge[0]].append(edge[1])
-                if adj.get(edge[1]) is None:
-                    adj[edge[1]] = []
-                adj[edge[1]].append(edge[0])
-                nodes.append(edge[0])
-                nodes.append(edge[1])
-            normal = polygon.normal
-            nodes = list(set(sorted(nodes)))
-            first = nodes[0]
-            loop = []
-            now = first
-            vis = {}
-            while True:
-                loop.append(now)
-                vis[now] = True
-                if vis.get(adj[now][0]) is None:
-                    now = adj[now][0]
-                elif vis.get(adj[now][1]) is None:
-                    now = adj[now][1]
-                else:
-                    break
-            for (second, third) in zip(loop[1:], loop[2:]):
-                faces.append((first, second, third))
-                normals.append(rot @ normal)
-        faces = np.array(faces, dtype=np.int32)
-        normals = np.array(normals, dtype=np.float32)
-        
-        coords = np.array([v.co for v in obj_verts])
+
+        if include_faces:
+            for polygon in obj.data.polygons:
+                edges = polygon.edge_keys
+                nodes = []
+                adj = {}
+                for edge in edges:
+                    if adj.get(edge[0]) is None:
+                        adj[edge[0]] = []
+                    adj[edge[0]].append(edge[1])
+                    if adj.get(edge[1]) is None:
+                        adj[edge[1]] = []
+                    adj[edge[1]].append(edge[0])
+                    nodes.append(edge[0])
+                    nodes.append(edge[1])
+                normal = polygon.normal
+                nodes = list(set(sorted(nodes)))
+                first = nodes[0]
+                loop = []
+                now = first
+                vis = {}
+                while True:
+                    loop.append(now)
+                    vis[now] = True
+                    if vis.get(adj[now][0]) is None:
+                        now = adj[now][0]
+                    elif vis.get(adj[now][1]) is None:
+                        now = adj[now][1]
+                    else:
+                        break
+                for (second, third) in zip(loop[1:], loop[2:]):
+                    faces.append((first, second, third))
+                    normals.append(rot @ normal)
+            faces = np.array(faces, dtype=np.int32)
+            normals = np.array(normals, dtype=np.float32)
+
+        coords = np.empty(total_vertices * 3, dtype=np.float32)
+        obj_verts.foreach_get("co", coords)
+        coords = coords.reshape(total_vertices, 3)
         rot_np = np.array(rot)
         coords = (rot_np @ coords.T).T + matrix_world_bias
         vertices[0:3, :coords.shape[0]] = coords.T
         
         # extract skin
-        if bones is not None:
+        if total_bones is not None:
             vg_lut = {}
             for v in obj_verts:
                 for g in v.groups:
@@ -400,31 +440,48 @@ def extract_mesh(bones=None):
                         skin_weight[v.index, col] = w
         
         vertices = vertices.T
-        # determine the orientation of the face normal
-        v0 = vertices[faces[:, 0]]
-        v1 = vertices[faces[:, 1]]
-        v2 = vertices[faces[:, 2]]
-        cross = np.cross(v1-v0, v2-v0)
-        dot = np.einsum("ij,ij->i", cross, normals)
-        correct_faces = faces.copy()
-        mask = dot < 0
-        correct_faces[mask, 1], correct_faces[mask, 2] = faces[mask, 2], faces[mask, 1]
-        
+        correct_faces = None
+        if include_faces:
+            # determine the orientation of the face normal
+            v0 = vertices[faces[:, 0]]
+            v1 = vertices[faces[:, 1]]
+            v2 = vertices[faces[:, 2]]
+            cross = np.cross(v1-v0, v2-v0)
+            dot = np.einsum("ij,ij->i", cross, normals)
+            correct_faces = faces.copy()
+            mask = dot < 0
+            correct_faces[mask, 1], correct_faces[mask, 2] = faces[mask, 2], faces[mask, 1]
+
         mesh_names_list.append(obj.name)
         vertices_list.append(vertices)
-        faces_list.append(correct_faces+cur_vertex_bias) # add bias to faces
+        if correct_faces is not None:
+            faces_list.append(correct_faces+cur_vertex_bias) # add bias to faces
         if total_bones is not None:
             skin_list.append(skin_weight)
         cur_vertex_bias += len(vertices)
-        cur_face_bias += len(faces)
         vertex_bias.append(cur_vertex_bias)
-        face_bias.append(cur_face_bias)
-    
-    vertices = np.vstack(vertices_list)
-    faces = np.vstack(faces_list)
-    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False, maintain_order=True)
-    vertex_normals = mesh.vertex_normals
-    face_normals = mesh.face_normals
+        if include_faces:
+            cur_face_bias += len(faces)
+            face_bias.append(cur_face_bias)
+
+    if len(vertices_list) > 0:
+        vertices = np.vstack(vertices_list)
+    else:
+        vertices = np.zeros((0, 3), dtype=np.float32)
+
+    if include_faces and len(faces_list) > 0:
+        faces = np.vstack(faces_list)
+        if include_normals:
+            mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False, maintain_order=True)
+            vertex_normals = mesh.vertex_normals
+            face_normals = mesh.face_normals
+        else:
+            vertex_normals = None
+            face_normals = None
+    else:
+        faces = None
+        vertex_normals = None
+        face_normals = None
     
     return {
         'mesh_names': np.array(mesh_names_list),
@@ -434,7 +491,7 @@ def extract_mesh(bones=None):
         'vertex_normals': vertex_normals,
         'skin': np.vstack(skin_list) if len(skin_list) > 0 else None,
         'vertex_bias': np.array(vertex_bias),
-        'face_bias': np.array(face_bias),
+        'face_bias': np.array(face_bias) if include_faces else None,
     }
 
 def get_matrix_basis(bones=None):
@@ -636,7 +693,6 @@ def make_asset(
     
     # 3. if there is skin, set vertex groups
     if asset.skin is not None and armature is not None and len(objects) > 0:
-        # must set to object mode to enable parent_set
         bpy.ops.object.mode_set(mode='OBJECT')
         N = len(objects)
         objects = bpy.data.objects
@@ -650,21 +706,31 @@ def make_asset(
             armature_b.select_set(True)
             bpy.ops.object.parent_set(type='ARMATURE_NAME')
             # sparsify
-            argsorted = np.argsort(-skin, axis=1)
-            vertex_group_reweight = skin[np.arange(skin.shape[0])[..., None], argsorted]
-            group_per_vertex = min(group_per_vertex, skin.shape[1])
             if group_per_vertex == -1:
-                group_per_vertex = vertex_group_reweight.shape[-1]
+                k = skin.shape[1]
+                argsorted = np.argsort(-skin, axis=1)
+                vertex_group_reweight = np.take_along_axis(skin, argsorted, axis=1)
+            else:
+                k = min(group_per_vertex, skin.shape[1])
+                topk = np.argpartition(-skin, kth=k-1, axis=1)[:, :k]
+                topk_weights = np.take_along_axis(skin, topk, axis=1)
+                order = np.argsort(-topk_weights, axis=1)
+                argsorted = np.take_along_axis(topk, order, axis=1)
+                vertex_group_reweight = np.take_along_axis(topk_weights, order, axis=1)
             if not do_not_normalize:
-                vertex_group_reweight = vertex_group_reweight / vertex_group_reweight[..., :group_per_vertex].sum(axis=1)[...,None]
+                denom = np.maximum(vertex_group_reweight.sum(axis=1, keepdims=True), 1e-8)
+                vertex_group_reweight = vertex_group_reweight / denom
             # clean vertex groups first in case skin exists
             for name in joint_names:
                 ob.vertex_groups[name].remove(range(990))
-            for v, w in enumerate(skin):
-                for ii in range(group_per_vertex):
+            for v in range(skin.shape[0]):
+                for ii in range(k):
+                    weight = vertex_group_reweight[v, ii]
+                    if weight <= 0:
+                        break
                     j = argsorted[v, ii]
                     n = joint_names[j]
-                    ob.vertex_groups[n].add([v], vertex_group_reweight[v, ii], 'REPLACE')
+                    ob.vertex_groups[n].add([v], weight, 'REPLACE')
     
     def to_matrix(x: ndarray):
         return Matrix((x[0, :], x[1, :], x[2, :], x[3, :]))
@@ -807,7 +873,7 @@ def transfer_rigging(
     assert source_asset.matrix_local is not None
     assert source_asset.parents is not None
     
-    target_asset = BpyParser.load(filepath=target_path)
+    target_asset = BpyParser.load_for_transfer(filepath=target_path)
     bpy.ops.outliner.orphans_purge(do_local_ids=True, do_linked_ids=True, do_recursive=True)
     data_types = [
         bpy.data.actions,
