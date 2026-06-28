@@ -1,8 +1,15 @@
 from copy import deepcopy
 from torch import nn, Tensor, FloatTensor
 from torch.nn.functional import pad
-from transformers import AutoModelForCausalLM, AutoConfig, LogitsProcessor, LogitsProcessorList # type: ignore
-from typing import Dict, List, Tuple
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    LogitsProcessor,
+    LogitsProcessorList,
+    StoppingCriteria,
+    StoppingCriteriaList,
+) # type: ignore
+from typing import Callable, Dict, List, Tuple
 
 import math
 import numpy as np
@@ -108,6 +115,50 @@ class VocabSwitchingLogitsProcessor(LogitsProcessor):
                     self._allowed_tokens_cache[prefix_key] = tokens
                 masks.append(self._mask_for_tokens(scores, tokens))
         return scores + torch.stack(masks, dim=0)
+
+
+class SamplingProgressCriteria(StoppingCriteria):
+    """Emit lightweight progress updates during autoregressive sampling.
+
+    This is intentionally approximate: we linearly map generated-token count to
+    the reserved sampling progress window using a fixed token budget.
+    """
+
+    def __init__(
+        self,
+        progress_callback: Callable[[int, str], None] | None,
+        stage: str = "model sampling",
+        progress_start: int = 10,
+        progress_end: int = 74,
+        estimated_total_tokens: int = 240,
+    ) -> None:
+        self.progress_callback = progress_callback
+        self.stage = stage
+        self.progress_start = progress_start
+        self.estimated_total_tokens = max(1, estimated_total_tokens)
+        self._max_sampling_progress = max(progress_start, progress_end - 1)
+        self._last_percent = progress_start
+
+    def _percent_for_tokens(self, token_count: int) -> int:
+        if token_count <= 0:
+            return self.progress_start
+        span = self._max_sampling_progress - self.progress_start
+        if span <= 0:
+            return self._max_sampling_progress
+        ratio = min(token_count / self.estimated_total_tokens, 1.0)
+        return min(
+            self._max_sampling_progress,
+            self.progress_start + math.floor(span * ratio),
+        )
+
+    def __call__(self, input_ids: Tensor, scores: FloatTensor, **kwargs) -> torch.BoolTensor:
+        if self.progress_callback is not None:
+            token_count = int(input_ids.shape[1])
+            percent = self._percent_for_tokens(token_count)
+            if percent > self._last_percent:
+                self._last_percent = percent
+                self.progress_callback(percent, f"{self.stage} ({token_count} tokens)")
+        return torch.zeros((input_ids.shape[0],), dtype=torch.bool, device=input_ids.device)
 
 class TokenRig(ModelSpec):
 
@@ -265,6 +316,7 @@ class TokenRig(ModelSpec):
         num_joints: int|None=None,
         parents: Tensor|None=None,
         num_samples: int=1,
+        progress_callback=None,
         **kwargs,
     ) -> TokenRigResult | List[TokenRigResult]:
         """
@@ -313,6 +365,16 @@ class TokenRig(ModelSpec):
         start_embed = self.transformer.get_input_embeddings()(start_tokens)
         inputs_embeds = torch.cat([learned_mesh_cond, start_embed], dim=1)
         
+        # Note: progress callback during token generation is not supported
+        # in transformers >=4.41 (CallbackHandler was removed). Use a custom
+        # stopping criterion instead, which is called once per decode step and
+        # works with beam search.
+        gen_kwargs = {k: v for k, v in kwargs.items() if k != 'repetition_penalty'}
+        if progress_callback is not None:
+            gen_kwargs['stopping_criteria'] = StoppingCriteriaList([
+                SamplingProgressCriteria(progress_callback=progress_callback)
+            ])
+
         results = self.transformer.generate(
             inputs_embeds=inputs_embeds,
             bos_token_id=self.tokenizer.bos,
@@ -325,8 +387,11 @@ class TokenRig(ModelSpec):
                 start_tokens=start_tokens[0],
             ),
             repetition_penalty=None,  # handled by logits_processor instead
-            **{k: v for k, v in kwargs.items() if k != 'repetition_penalty'},
+            **gen_kwargs,
         )
+        if progress_callback is not None:
+            progress_callback(74, f"exporting sample...")
+
         outputs: List[TokenRigResult] = []
         for i in range(num_samples):
             output_ids = results[i]
@@ -452,6 +517,7 @@ class TokenRig(ModelSpec):
         parents=None,
         num_joints=None,
         make_asset: bool=False,
+        progress_callback=None,
         **kwargs
     ) -> Dict:
         vertices: Tensor   = batch['vertices']
@@ -478,6 +544,7 @@ class TokenRig(ModelSpec):
                 parents=None if parents is None else parents[i],
                 num_joints=None if num_joints is None else num_joints[i],
                 num_samples=num_samples,
+                progress_callback=progress_callback,
                 **{k: v for k, v in generate_kwargs.items() if k != 'num_samples'}
             )
             if num_samples == 1:

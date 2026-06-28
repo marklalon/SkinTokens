@@ -433,25 +433,51 @@ def _run_generation(
 
             cancellation.raise_if_cancelled()
             if progress_callback:
-                progress_callback(30, "model sampling")
+                progress_callback(10, "model sampling")
 
             with torch.inference_mode():
                 preds: List[TokenRigResult] = state.model.predict_step(
                     batch,
                     skeleton_tokens=[skeleton_tokens] if skeleton_tokens is not None else None,
                     make_asset=True,
+                    progress_callback=progress_callback if progress_callback else None,
                 )["results"]
 
             cancellation.raise_if_cancelled()
-            if progress_callback:
-                progress_callback(60, "post-processing")
-
             # --- Export each sample as a separate GLB ---
             all_glbs: list[tuple[bytes, dict]] = []
             from src.rig_package.parser.bpy import transfer_rigging
+            sample_count = max(len(preds), 1)
+            sample_progress_start = 75
+            sample_progress_span = 24
+
+            def report_sample_progress(sample_idx: int, phase: str) -> None:
+                if not progress_callback:
+                    return
+                base = sample_progress_start + (sample_progress_span * sample_idx) // sample_count
+                done = sample_progress_start + (
+                    sample_progress_span * (sample_idx + 1)
+                ) // sample_count
+                mid = base + max(1, (done - base) // 2)
+                sample_label = f"sample {sample_idx + 1}/{sample_count}"
+                if phase == "start":
+                    if sample_idx > 0:
+                        return
+                    step = f"exporting {sample_label}"
+                    percent = base
+                elif phase == "exported":
+                    step = f"exported {sample_label}"
+                    percent = min(mid, done - 1)
+                elif phase == "complete":
+                    step = f"finished {sample_label}"
+                    percent = done
+                else:
+                    raise ValueError(f"unknown sample progress phase: {phase}")
+                progress_callback(percent, step)
 
             for sample_idx, pred in enumerate(preds):
                 cancellation.raise_if_cancelled()
+                report_sample_progress(sample_idx, "start")
 
                 asset = pred.asset
                 assert asset is not None
@@ -469,9 +495,6 @@ def _run_generation(
                     )
                     asset.normalize_skin()
 
-                if progress_callback:
-                    progress_callback(75, "exporting GLB")
-
                 sample_out_path = tmp_output_dir / f"sample_{sample_idx}.glb"
                 sample_out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -486,13 +509,12 @@ def _run_generation(
 
                 glb_data = sample_out_path.read_bytes()
                 cancellation.raise_if_cancelled()
+                report_sample_progress(sample_idx, "exported")
 
                 if params.skip_renamer:
                     logger.info("[%s] sample=%d skipping skeleton renamer", request_id, sample_idx)
                     all_glbs.append((glb_data, {}))
                 else:
-                    if progress_callback:
-                        progress_callback(96, "starting skeleton rename")
                     renamed_data, renamer_meta = _run_skeleton_rename(
                         glb_data,
                         file_name=filename,
@@ -502,6 +524,7 @@ def _run_generation(
                         image_name=image_name,
                     )
                     all_glbs.append((renamed_data, renamer_meta))
+                report_sample_progress(sample_idx, "complete")
 
             if progress_callback:
                 progress_callback(100, "complete")
@@ -598,25 +621,32 @@ def _run_skeleton_rename(
 class ProgressReporter:
     """Per-request progress/timing."""
 
+    CLIENT_ONLY_STAGE_PREFIXES = ("model sampling",)
+
     def __init__(self, request_id: str, cancellation: CancellationToken,
                  progress_callback=None):
         self.request_id = request_id
         self.cancellation = cancellation
         self.progress_callback = progress_callback
         self.started_at = time.monotonic()
-        self.last_report_at = self.started_at
+        self.last_logged_at = self.started_at
 
     def raise_if_cancelled(self) -> None:
         self.cancellation.raise_if_cancelled()
 
+    def _should_log(self, stage: str) -> bool:
+        return not any(stage.startswith(prefix)
+                       for prefix in self.CLIENT_ONLY_STAGE_PREFIXES)
+
     def report(self, percent: int, stage: str) -> None:
         self.raise_if_cancelled()
         now = time.monotonic()
-        delta = now - self.last_report_at
-        self.last_report_at = now
         elapsed = round(now - self.started_at, 2)
-        logger.info("[%s] progress=%d%% stage=%s elapsed=%.2fs delta=%.2fs",
-                    self.request_id, percent, stage, elapsed, delta)
+        if self._should_log(stage):
+            delta = now - self.last_logged_at
+            self.last_logged_at = now
+            logger.info("[%s] progress=%d%% stage=%s elapsed=%.2fs delta=%.2fs",
+                        self.request_id, percent, stage, elapsed, delta)
         if self.progress_callback is not None:
             self.progress_callback(percent, stage, elapsed)
         self.raise_if_cancelled()
