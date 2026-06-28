@@ -20,6 +20,7 @@ import os
 import sys
 import time
 from contextlib import suppress
+from pathlib import Path
 
 
 def _websocket_url(server: str) -> str:
@@ -62,6 +63,13 @@ class ProgressDisplay:
             self.active = False
 
 
+def _sample_output_path(output_path: str, sample_index: int, total_samples: int) -> str:
+    if total_samples <= 1:
+        return output_path
+    path = Path(output_path)
+    return str(path.with_name(f"{path.stem}_{sample_index}{path.suffix or '.glb'}"))
+
+
 async def _run(args) -> None:
     try:
         import websockets
@@ -91,6 +99,7 @@ async def _run(args) -> None:
         "temperature": args.temperature,
         "repetition_penalty": args.repetition_penalty,
         "num_beams": args.num_beams,
+        "num_samples": args.num_samples,
         "do_sample": True,
         "use_skeleton": args.use_skeleton,
         "use_postprocess": args.use_postprocess,
@@ -114,18 +123,25 @@ async def _run(args) -> None:
             if image_data:
                 await ws.send(image_data)
 
+            glb_count = 0
+            expected_samples = args.num_samples
+            pending_sample_index = 0
             try:
                 async for raw_message in ws:
-                    # raw_message may be bytes (binary frame) or str (text frame)
                     if isinstance(raw_message, bytes):
-                        # This is the GLB binary after "done" stage
                         glb = raw_message
-                        output_dir = os.path.dirname(os.path.abspath(args.output))
+                        sample_output = _sample_output_path(
+                            args.output, pending_sample_index, expected_samples
+                        )
+                        glb_count += 1
+                        output_dir = os.path.dirname(os.path.abspath(sample_output))
                         os.makedirs(output_dir, exist_ok=True)
-                        with open(args.output, "wb") as f:
+                        with open(sample_output, "wb") as f:
                             f.write(glb)
-                        print(f"[client] saved {len(glb)} bytes -> {args.output}")
-                        return
+                        print(f"[client] saved {len(glb)} bytes -> {sample_output}")
+                        if glb_count >= expected_samples:
+                            return
+                        continue
 
                     message = json.loads(raw_message)
                     stage = message.get("stage", "unknown")
@@ -142,13 +158,16 @@ async def _run(args) -> None:
                             message.get("elapsed_sec"),
                         )
                     elif stage == "done":
+                        expected_samples = int(message.get("num_samples", expected_samples))
+                        pending_sample_index = int(message.get("sample_index", glb_count))
                         progress.update(100, "complete", message.get("elapsed_sec"))
                         progress.finish()
                         # Binary GLB frame follows the done message
                         renamer_meta = {k: v for k, v in message.items()
                                          if k not in ("stage", "glb_size",
                                                       "elapsed_sec", "progress",
-                                                      "request_id")}
+                                                      "request_id", "sample_index",
+                                                      "num_samples")}
                         if renamer_meta:
                             for k, v in renamer_meta.items():
                                 print(f"[client] {k}: {v}")
@@ -192,6 +211,7 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=0.1, help="Temperature (default: 0.1)")
     parser.add_argument("--repetition-penalty", type=float, default=1.0, help="Repetition penalty (default: 1.0)")
     parser.add_argument("--num-beams", type=int, default=5, help="Number of beams (default: 5)")
+    parser.add_argument("--num-samples", type=int, default=1, help="Number of parallel samples to generate (default: 1)")
 
     parser.add_argument("--use-skeleton", action="store_true", help="Use skeleton for skin generation")
     parser.add_argument("--use-postprocess", action="store_true", help="Use postprocess (voxel skin)")

@@ -264,19 +264,25 @@ class TokenRig(ModelSpec):
         return_decode_dict: bool=False,
         num_joints: int|None=None,
         parents: Tensor|None=None,
+        num_samples: int=1,
         **kwargs,
-    ) -> TokenRigResult:
+    ) -> TokenRigResult | List[TokenRigResult]:
         """
-        Do not support batch!
+        Generate N samples in parallel by replicating inputs along the batch dimension.
+        When num_samples=1, returns a single TokenRigResult (backward compatible).
+        When num_samples>1, returns a list of TokenRigResult.
         """
         assert isinstance(self.vae.model, SkinFSQCVAEModel)
         assert vertices.dim() == 2, 'do not support batch'
         assert normals.dim() == 2, 'do not support batch'
+        if num_samples < 1:
+            raise ValueError(f"num_samples must be >= 1, got {num_samples}")
         
         if isinstance(skeleton_tokens, np.ndarray):
             skeleton_tokens = torch.from_numpy(skeleton_tokens).to(self.device)
         
-        cond = torch.cat([vertices, normals], dim=-1).unsqueeze(0)
+        # Encode mesh condition once, then replicate for parallel sampling.
+        cond = torch.cat([vertices, normals], dim=-1).unsqueeze(0)  # (1, N, 6)
         _, cond_latents = self.vae.model._encode(
             x=None,
             cond=cond,
@@ -285,18 +291,25 @@ class TokenRig(ModelSpec):
             return_z=False,
         )
         assert cond_latents is not None
-        # (1, len, dim)
+
         learned_mesh_cond = encode_mesh_cond(self.mesh_encoder, self.output_proj, self.tokens_skin_cond, {'vertices': vertices, 'normals': normals})
+        if num_samples > 1:
+            cond = cond.repeat(num_samples, 1, 1)
+            cond_latents = cond_latents.repeat(num_samples, 1, 1)
+            learned_mesh_cond = learned_mesh_cond.repeat(num_samples, 1, 1)
         
         device = cond.device
-        start_tokens = torch.tensor(self.make_start_tokens(
+        start_tokens_list = self.make_start_tokens(
             device=device,
             cls=None if cls is None else [cls],
             skeleton_tokens=None if skeleton_tokens is None else [skeleton_tokens],
             num_joints=None if num_joints is None else [num_joints],
             parents=None if parents is None else [parents],
-        )[0], device=device).unsqueeze(0)
-        assert start_tokens.shape[0] == 1
+        )
+        start_tokens = torch.tensor(start_tokens_list, device=device)  # (1, seq_len)
+        if num_samples > 1:
+            start_tokens = start_tokens.repeat(num_samples, 1)  # (num_samples, seq_len)
+        
         start_embed = self.transformer.get_input_embeddings()(start_tokens)
         inputs_embeds = torch.cat([learned_mesh_cond, start_embed], dim=1)
         
@@ -314,31 +327,41 @@ class TokenRig(ModelSpec):
             repetition_penalty=None,  # handled by logits_processor instead
             **{k: v for k, v in kwargs.items() if k != 'repetition_penalty'},
         )
+        outputs: List[TokenRigResult] = []
+        for i in range(num_samples):
+            output_ids = results[i]
+            for token in reversed(start_tokens[i]):
+                v = token.item()
+                output_ids = pad(output_ids, (1, 0), value=v)
+            
+            res = TokenRigResult()
+            res.input_ids = start_tokens[i]
+            res.output_ids = output_ids
+            if only_ids:
+                outputs.append(res)
+                continue
+            
+            res.cond = cond[i]
+            res.cond_latents = cond_latents[i]
+            if return_decode_dict:
+                outputs.append(res)
+                continue
+            
+            d = decode(
+                cond=cond[i],
+                cond_latents=cond_latents[i],
+                inputs_ids=output_ids,
+                tokenizer=self.tokenizer,
+                tokens_per_skin=self.tokens_per_skin,
+                vae=self.vae,
+            )
+            res.skin_pred = d['skin_pred']
+            res.detokenize_output = d['detokenize_output']
+            outputs.append(res)
         
-        res = TokenRigResult()
-        output_ids = results[0, :]
-        for token in reversed(start_tokens[0]):
-            v = token.item()
-            output_ids = pad(output_ids, (1, 0), value=v)
-        res.input_ids = start_tokens[0]
-        res.output_ids = output_ids
-        if only_ids:
-            return res
-        res.cond = cond[0]
-        res.cond_latents = cond_latents[0]
-        if return_decode_dict:
-            return res
-        d = decode(
-            cond=cond[0],
-            cond_latents=cond_latents[0],
-            inputs_ids=output_ids,
-            tokenizer=self.tokenizer,
-            tokens_per_skin=self.tokens_per_skin,
-            vae=self.vae,
-        )
-        res.skin_pred = d['skin_pred']
-        res.detokenize_output = d['detokenize_output']
-        return res
+        if num_samples == 1:
+            return outputs[0]
+        return outputs
 
     def _debug_export(
         self,
@@ -435,6 +458,9 @@ class TokenRig(ModelSpec):
         normals : Tensor   = batch['normals']
         cls = batch['cls']
         generate_kwargs = deepcopy(batch['generate_kwargs'])
+        num_samples = generate_kwargs.pop('num_samples', 1)
+        if num_samples < 1:
+            raise ValueError(f"num_samples must be >= 1, got {num_samples}")
 
         if vertices.dim() == 2:
             vertices = vertices.unsqueeze(0)
@@ -444,44 +470,48 @@ class TokenRig(ModelSpec):
             skeleton_tokens = [None] * vertices.shape[0]
         d = {}
         for i in range(vertices.shape[0]):
-            res = self.generate(
+            gen_results = self.generate(
                 vertices=vertices[i],
                 normals=normals[i],
                 skeleton_tokens=skeleton_tokens[i],
                 cls=None if no_cls else cls[i],
                 parents=None if parents is None else parents[i],
                 num_joints=None if num_joints is None else num_joints[i],
-                **generate_kwargs
+                num_samples=num_samples,
+                **{k: v for k, v in generate_kwargs.items() if k != 'num_samples'}
             )
-            if make_asset:
-                assert 'model_input' in batch, "need model_input to make asset (in validate/predict mode)"
-                if res.detokenize_output is None:
-                    raise ValueError("generation produced an undecodable skeleton")
-                if res.skin_pred is None:
-                    where_eos = (
-                        torch.where(res.output_ids == self.tokenizer.eos)[0]
-                        if res.output_ids is not None else torch.empty(0, device=vertices.device)
+            if num_samples == 1:
+                gen_results = [gen_results]
+            for res in gen_results:
+                if make_asset:
+                    assert 'model_input' in batch, "need model_input to make asset (in validate/predict mode)"
+                    if res.detokenize_output is None:
+                        raise ValueError("generation produced an undecodable skeleton")
+                    if res.skin_pred is None:
+                        where_eos = (
+                            torch.where(res.output_ids == self.tokenizer.eos)[0]
+                            if res.output_ids is not None else torch.empty(0, device=vertices.device)
+                        )
+                        actual = 0
+                        if res.output_ids is not None and where_eos.numel() > 0:
+                            actual = max(0, res.output_ids.shape[0] - where_eos[0].item() - 1)
+                        expected = res.detokenize_output.joints.shape[0] * self.tokens_per_skin
+                        raise ValueError(
+                            "generation produced incomplete skin tokens: "
+                            f"expected {expected}, got {actual}"
+                        )
+                    asset: Asset = batch['model_input'][i].asset.copy()
+                    res.asset = Asset.from_data(
+                        vertices=asset.vertices,
+                        faces=asset.faces,
+                        sampled_vertices=vertices[i].detach().float().cpu().numpy(),
+                        sampled_skin=res.skin_pred.detach().float().cpu().numpy(),
+                        joints=res.detokenize_output.joints,
+                        parents=np.array(res.detokenize_output.parents),
+                        cls=asset.cls,
+                        path=asset.path,
                     )
-                    actual = 0
-                    if res.output_ids is not None and where_eos.numel() > 0:
-                        actual = max(0, res.output_ids.shape[0] - where_eos[0].item() - 1)
-                    expected = res.detokenize_output.joints.shape[0] * self.tokens_per_skin
-                    raise ValueError(
-                        "generation produced incomplete skin tokens: "
-                        f"expected {expected}, got {actual}"
-                    )
-                asset: Asset = batch['model_input'][i].asset.copy()
-                res.asset = Asset.from_data(
-                    vertices=asset.vertices,
-                    faces=asset.faces,
-                    sampled_vertices=vertices[i].detach().float().cpu().numpy(),
-                    sampled_skin=res.skin_pred.detach().float().cpu().numpy(),
-                    joints=res.detokenize_output.joints,
-                    parents=np.array(res.detokenize_output.parents),
-                    cls=asset.cls,
-                    path=asset.path,
-                )
-            results.append(res)
+                results.append(res)
         d['results'] = results
         return d
     

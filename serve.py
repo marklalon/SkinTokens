@@ -64,7 +64,7 @@ _runtime_import_started = time.monotonic()
 import torch
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from tqdm import tqdm
 
 logger.info("Startup progress: runtime dependencies imported elapsed=%.2fs",
@@ -275,6 +275,7 @@ class GenParams(BaseModel):
     temperature: float = 0.1
     repetition_penalty: float = 1.0
     num_beams: int = 5
+    num_samples: int = Field(default=1, ge=1)
     use_skeleton: bool = False
     use_postprocess: bool = False
     skip_renamer: bool = False
@@ -337,8 +338,9 @@ def _run_generation(
     progress_callback=None,
     image_data: bytes | None = None,
     image_name: str | None = None,
-) -> bytes:
-    """Run the full rigging pipeline and return GLB bytes."""
+) -> list[tuple[bytes, dict]]:
+    """Run the full rigging pipeline and return a list of (glb_bytes, renamer_meta) tuples,
+    one per sample (controlled by num_samples in GenParams)."""
     from pathlib import Path
     from torch import Tensor
     from src.data.dataset import DatasetConfig, RigDatasetModule
@@ -355,7 +357,6 @@ def _run_generation(
     tmp_input_dir = Path(tempfile.mkdtemp(prefix="skintokens_input_"))
     tmp_output_dir = Path(tempfile.mkdtemp(prefix="skintokens_output_"))
     input_path = tmp_input_dir / filename
-    out_path = tmp_output_dir / f"{Path(filename).stem}.glb"
 
     try:
         input_path.write_bytes(file_data)
@@ -419,8 +420,8 @@ def _run_generation(
                 top_p=params.top_p,
                 temperature=params.temperature,
                 repetition_penalty=params.repetition_penalty,
-                num_return_sequences=1,
                 num_beams=params.num_beams,
+                num_samples=params.num_samples,
                 do_sample=True,
             )
 
@@ -445,61 +446,67 @@ def _run_generation(
             if progress_callback:
                 progress_callback(60, "post-processing")
 
-            asset = preds[0].asset
-            assert asset is not None
-
-            if params.use_postprocess:
-                voxel = asset.voxel(resolution=196)
-                asset.skin *= voxel_skin(
-                    grid=0,
-                    grid_coords=voxel.coords,
-                    joints=asset.joints,
-                    vertices=asset.vertices,
-                    faces=asset.faces,
-                    mode="square",
-                    voxel_size=voxel.voxel_size,
-                )
-                asset.normalize_skin()
-
-            if progress_callback:
-                progress_callback(75, "exporting GLB")
-
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-
+            # --- Export each sample as a separate GLB ---
+            all_glbs: list[tuple[bytes, dict]] = []
             from src.rig_package.parser.bpy import transfer_rigging
 
-            with _suppress_bpy_output():
-                transfer_rigging(
-                    source_asset=asset,
-                    target_path=asset.path,
-                    export_path=str(out_path),
-                    group_per_vertex=4,
-                    auto_ground=True,
-                )
+            for sample_idx, pred in enumerate(preds):
+                cancellation.raise_if_cancelled()
 
-            glb_data = out_path.read_bytes()
+                asset = pred.asset
+                assert asset is not None
 
-            cancellation.raise_if_cancelled()
+                if params.use_postprocess:
+                    voxel = asset.voxel(resolution=196)
+                    asset.skin *= voxel_skin(
+                        grid=0,
+                        grid_coords=voxel.coords,
+                        joints=asset.joints,
+                        vertices=asset.vertices,
+                        faces=asset.faces,
+                        mode="square",
+                        voxel_size=voxel.voxel_size,
+                    )
+                    asset.normalize_skin()
 
-            if params.skip_renamer:
-                logger.info("[%s] skipping skeleton renamer (requested by client)", request_id)
-                renamer_meta = {}
-            else:
                 if progress_callback:
-                    progress_callback(96, "starting skeleton rename")
-                glb_data, renamer_meta = _run_skeleton_rename(
-                    glb_data,
-                    file_name=filename,
-                    conf_thresh=0.8,
-                    request_id=request_id,
-                    image_data=image_data,
-                    image_name=image_name,
-                )
+                    progress_callback(75, "exporting GLB")
+
+                sample_out_path = tmp_output_dir / f"sample_{sample_idx}.glb"
+                sample_out_path.parent.mkdir(parents=True, exist_ok=True)
+
+                with _suppress_bpy_output():
+                    transfer_rigging(
+                        source_asset=asset,
+                        target_path=asset.path,
+                        export_path=str(sample_out_path),
+                        group_per_vertex=4,
+                        auto_ground=True,
+                    )
+
+                glb_data = sample_out_path.read_bytes()
+                cancellation.raise_if_cancelled()
+
+                if params.skip_renamer:
+                    logger.info("[%s] sample=%d skipping skeleton renamer", request_id, sample_idx)
+                    all_glbs.append((glb_data, {}))
+                else:
+                    if progress_callback:
+                        progress_callback(96, "starting skeleton rename")
+                    renamed_data, renamer_meta = _run_skeleton_rename(
+                        glb_data,
+                        file_name=filename,
+                        conf_thresh=0.8,
+                        request_id=request_id,
+                        image_data=image_data,
+                        image_name=image_name,
+                    )
+                    all_glbs.append((renamed_data, renamer_meta))
 
             if progress_callback:
                 progress_callback(100, "complete")
 
-            return glb_data, renamer_meta
+            return all_glbs
 
         raise RuntimeError("No data in dataloader")
     finally:
@@ -628,9 +635,9 @@ async def _generate(
     """Run generation with lock serialization.
 
     Returns:
-        Tuple of (glb_bytes, renamer_meta).  renamer_meta is a dict of all
-        extra fields from the skeleton-renamer "done" message (e.g.
-        ``species``, ``species_tags``, ``joint_count``).
+        List of (glb_bytes, renamer_meta) tuples, one per sample.
+        renamer_meta is a dict of all extra fields from the skeleton-renamer
+        "done" message (e.g. ``species``, ``species_tags``, ``joint_count``).
     """
     cancellation = cancellation or CancellationToken()
     reporter = ProgressReporter(request_id, cancellation, progress_callback)
@@ -644,7 +651,7 @@ async def _generate(
         logger.info("[%s] generation lock acquired after %.2fs", request_id,
                     time.monotonic() - wait_started)
         try:
-            glb, renamer_meta = await _to_thread_cancellable(
+            results = await _to_thread_cancellable(
                 _run_generation, file_data, filename, params, request_id,
                 cancellation, reporter.report, image_data, image_name,
                 cancellation=cancellation,
@@ -652,7 +659,7 @@ async def _generate(
         finally:
             state.busy = False
 
-    return glb, renamer_meta
+    return results
 
 
 async def _watch_ws_cancellation(
@@ -828,20 +835,24 @@ async def ws_generate(ws: WebSocket):
         with suppress(asyncio.CancelledError):
             await receiver_task
 
-        glb, renamer_meta = await generation_task
-        done_msg: dict = {
-            "stage": "done",
-            "elapsed_sec": round(time.time() - t0, 2),
-            "progress": 100,
-            "request_id": request_id,
-            "glb_size": len(glb),
-        }
-        done_msg.update(renamer_meta)
-        await ws.send_json(done_msg)
-        await ws.send_bytes(glb)
-        logger.info("[%s] WebSocket request completed bytes=%d elapsed=%.2fs meta=%s",
-                    request_id, len(glb), time.time() - t0,
-                    json.dumps(renamer_meta, ensure_ascii=False)[:200])
+        results = await generation_task  # list of (glb, renamer_meta)
+
+        for sample_idx, (glb, renamer_meta) in enumerate(results):
+            done_msg: dict = {
+                "stage": "done",
+                "sample_index": sample_idx,
+                "num_samples": len(results),
+                "elapsed_sec": round(time.time() - t0, 2),
+                "progress": 100,
+                "request_id": request_id,
+                "glb_size": len(glb),
+            }
+            done_msg.update(renamer_meta)
+            await ws.send_json(done_msg)
+            await ws.send_bytes(glb)
+
+        logger.info("[%s] WebSocket request completed samples=%d elapsed=%.2fs",
+                    request_id, len(results), time.time() - t0)
         await ws.close()
 
     except WebSocketDisconnect:
