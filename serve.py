@@ -272,11 +272,11 @@ async def _to_thread_cancellable(operation, *args, cancellation: CancellationTok
 # Generation parameters
 # --------------------------------------------------------------------------- #
 class GenParams(BaseModel):
-    top_k: int = 1
-    top_p: float = 1.0
-    temperature: float = 0.1
+    top_k: int = 5
+    top_p: float = 0.95
+    temperature: float = 1.0
     repetition_penalty: float = 1.0
-    num_beams: int = Field(default=10, ge=1, le=16)
+    num_beams: int = Field(default=8, ge=1, le=16)
     num_samples: int = Field(default=1, ge=1, le=8)
     seed: int | None = None
     use_skeleton: bool = False

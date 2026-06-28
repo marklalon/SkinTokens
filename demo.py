@@ -221,11 +221,11 @@ if __name__ == "__main__":
     parser.add_argument("--input", help="Input file or directory")
     parser.add_argument("--output", default=None, help="Output file or directory (default: outputs/{input_name}_bind.glb)")
 
-    parser.add_argument("--top_k", type=int, default=1)
-    parser.add_argument("--top_p", type=float, default=1)
-    parser.add_argument("--temperature", type=float, default=0.1)
+    parser.add_argument("--top_k", type=int, default=5)
+    parser.add_argument("--top_p", type=float, default=0.95)
+    parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--repetition_penalty", type=float, default=1.0)
-    parser.add_argument("--num_beams", type=int, default=5)
+    parser.add_argument("--num_beams", type=int, default=8)
 
     parser.add_argument("--use_skeleton", action="store_true")
     parser.add_argument("--use_postprocess", action="store_true")
