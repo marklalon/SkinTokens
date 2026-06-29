@@ -36,6 +36,7 @@ import logging
 import numpy as np
 import random
 import sys
+import shutil
 import tempfile
 import threading
 import time
@@ -91,6 +92,12 @@ SUPPORTED_EXT = {".obj", ".fbx", ".glb"}
 SKELETON_RENAMER_URL = os.environ.get(
     "SKINTOKENS_SKELETON_RENAMER_URL",
     "http://skeleton-renamer:8088",
+)
+# Max concurrent skeleton-renamer calls. The renamer is a remote network
+# service that touches neither the local GPU nor bpy, so its calls are safe to
+# run in parallel — bounded only to avoid overwhelming the remote service.
+RENAMER_CONCURRENCY = max(
+    1, int(os.environ.get("SKINTOKENS_RENAMER_CONCURRENCY", "4"))
 )
 
 
@@ -159,11 +166,26 @@ class ServerState:
     model = None
     tokenizer = None
     transform = None
-    generation_executor: Optional[ThreadPoolExecutor] = None
+    # bpy is a process-global Blender singleton and is NOT thread-safe: every
+    # geometry op shares one scene. All bpy work (parse + export) is pinned to a
+    # single dedicated thread and serialized by ``bpy_lock``.
+    bpy_executor: Optional[ThreadPoolExecutor] = None
+    # GPU inference does not touch bpy, so it runs on its own thread and is
+    # serialized independently by ``gpu_lock`` (single instance — one forward at
+    # a time to bound VRAM). Pipelining: request N's bpy export can overlap with
+    # request N+1's GPU inference.
+    gpu_executor: Optional[ThreadPoolExecutor] = None
     ready: bool = False
     loaded_at: float = 0.0
-    busy: bool = False
-    generation_lock: asyncio.Lock = asyncio.Lock()
+    active_jobs: int = 0
+    bpy_lock: asyncio.Lock = asyncio.Lock()
+    gpu_lock: asyncio.Lock = asyncio.Lock()
+    # Remote renamer calls are independent network I/O — safe to run in parallel.
+    renamer_sem: asyncio.Semaphore = asyncio.Semaphore(RENAMER_CONCURRENCY)
+
+    @property
+    def busy(self) -> bool:
+        return self.active_jobs > 0
 
 
 state = ServerState()
@@ -247,10 +269,12 @@ async def _acquire_or_cancel(lock: asyncio.Lock, cancellation: CancellationToken
             lock.release()
 
 
-async def _to_thread_cancellable(operation, *args, cancellation: CancellationToken):
+async def _to_thread_cancellable(
+    executor: ThreadPoolExecutor, operation, *args, cancellation: CancellationToken
+):
     """Keep a lock held until cancelled worker code has really stopped."""
     loop = asyncio.get_running_loop()
-    worker = loop.run_in_executor(state.generation_executor, operation, *args)
+    worker = loop.run_in_executor(executor, operation, *args)
     try:
         return await asyncio.shield(worker)
     except asyncio.CancelledError:
@@ -299,15 +323,22 @@ def _load_pipeline():
     from src.tokenizer.parse import get_tokenizer
     from src.server.spec import get_model
 
-    if state.generation_executor is None:
-        state.generation_executor = ThreadPoolExecutor(
+    if state.bpy_executor is None:
+        state.bpy_executor = ThreadPoolExecutor(
             max_workers=1,
-            thread_name_prefix="skintokens-gen",
+            thread_name_prefix="skintokens-bpy",
+        )
+    if state.gpu_executor is None:
+        state.gpu_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="skintokens-gpu",
         )
 
     def load_bpy_fn():
-        assert state.generation_executor is not None
-        state.generation_executor.submit(_load_bpy_inproc).result()
+        # bpy must be imported/initialized on the same thread that later runs
+        # all geometry ops, so it is pinned to the dedicated bpy executor.
+        assert state.bpy_executor is not None
+        state.bpy_executor.submit(_load_bpy_inproc).result()
 
     _run_startup_stage("initializing geometry runtime", load_bpy_fn)
 
@@ -332,241 +363,271 @@ def _load_pipeline():
 # --------------------------------------------------------------------------- #
 # Core generation logic
 # --------------------------------------------------------------------------- #
-def _run_generation(
-    file_data: bytes,
-    filename: str,
+@contextmanager
+def _seeded_torch_rng(seed: int | None):
+    """Scope a seed to torch/CUDA RNG only, restoring global state on exit.
+
+    HuggingFace ``generate`` samples from the *global* torch RNG (it accepts no
+    per-call generator), so a request's seed has to be applied globally. Because
+    the GPU stage is serialized by ``gpu_lock`` (one inference at a time) and no
+    other concurrent stage consumes torch RNG (bpy stages use ``np.random``),
+    seeding here is race-free. Saving/restoring the state additionally prevents a
+    seeded request from perturbing a later request's sampling. numpy/python RNG
+    is deliberately left untouched so it cannot collide with bpy stages running
+    concurrently on another request.
+    """
+    if seed is None:
+        yield
+        return
+    cpu_state = torch.get_rng_state()
+    cuda_states = (
+        torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    )
+    try:
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        yield
+    finally:
+        torch.set_rng_state(cpu_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
+
+
+def _report_sample_progress(
+    progress_callback, sample_count: int, sample_idx: int, phase: str
+) -> None:
+    """Map a per-sample export/rename phase to a percentage in the 75–99 band."""
+    if not progress_callback:
+        return
+    sample_progress_start = 75
+    sample_progress_span = 24
+    base = sample_progress_start + (sample_progress_span * sample_idx) // sample_count
+    done = sample_progress_start + (
+        sample_progress_span * (sample_idx + 1)
+    ) // sample_count
+    mid = base + max(1, (done - base) // 2)
+    sample_label = f"sample {sample_idx + 1}/{sample_count}"
+    if phase == "start":
+        if sample_idx > 0:
+            return
+        step = f"exporting {sample_label}"
+        percent = base
+    elif phase == "exported":
+        step = f"exported {sample_label}"
+        percent = min(mid, done - 1)
+    elif phase == "renaming":
+        step = f"renaming {sample_label}"
+        percent = base + round((done - base) * 0.9)
+    elif phase == "complete":
+        step = f"finished {sample_label}"
+        percent = done
+    else:
+        raise ValueError(f"unknown sample progress phase: {phase}")
+    progress_callback(percent, step)
+
+
+def _prepare_inputs(
+    input_path: "Path",
     params: GenParams,
     request_id: str,
     cancellation: CancellationToken,
     progress_callback=None,
-) -> list[tuple[bytes, dict]]:
-    """Run the full rigging pipeline and return a list of (glb_bytes, renamer_meta) tuples,
-    one per sample (controlled by num_samples in GenParams)."""
-    from pathlib import Path
-    from torch import Tensor
+):
+    """Stage 1 (bpy): parse the input file into a single model batch.
+
+    Runs on the dedicated bpy thread under ``bpy_lock``. Returns CPU tensors plus
+    the parsed asset data; once returned the batch no longer depends on the live
+    Blender scene, so the bpy lock can be released before inference.
+    """
     from src.data.dataset import DatasetConfig, RigDatasetModule
-    from src.model.tokenrig import TokenRigResult
-    from src.data.vertex_group import voxel_skin
 
     cancellation.raise_if_cancelled()
+    if progress_callback:
+        progress_callback(5, "building dataset")
 
-    # Write input file to temp location
-    suffix = Path(filename).suffix.lower()
-    if suffix not in SUPPORTED_EXT:
-        raise ValueError(f"Unsupported file format: {suffix}. Supported: {SUPPORTED_EXT}")
+    datapath = {
+        "data_name": None,
+        "loader": "bpy",
+        "filepaths": {"articulation": [str(input_path)]},
+    }
 
-    tmp_input_dir = Path(tempfile.mkdtemp(prefix="skintokens_input_"))
-    tmp_output_dir = Path(tempfile.mkdtemp(prefix="skintokens_output_"))
-    input_path = tmp_input_dir / filename
+    dataset_config = DatasetConfig.parse(
+        shuffle=False,
+        batch_size=1,
+        num_workers=0,
+        pin_memory=DEVICE.startswith("cuda"),
+        persistent_workers=False,
+        datapath=datapath,
+    ).split_by_cls()
 
-    try:
-        input_path.write_bytes(file_data)
+    module = RigDatasetModule(
+        predict_dataset_config=dataset_config,
+        predict_transform=state.transform,
+        tokenizer=state.tokenizer,
+        process_fn=state.model._process_fn,
+    )
+
+    with _suppress_bpy_output():
+        dataloader = module.predict_dataloader()["articulation"]
+    cancellation.raise_if_cancelled()
+
+    batch_iterator = iter(dataloader)
+    with _suppress_bpy_output():
+        try:
+            batch = next(batch_iterator)
+        except StopIteration:
+            batch = None
+
+    if batch is None:
+        raise RuntimeError("No data in dataloader")
+    return batch
+
+
+def _run_inference(
+    batch: dict,
+    params: GenParams,
+    request_id: str,
+    cancellation: CancellationToken,
+    progress_callback=None,
+):
+    """Stage 2 (GPU): run model sampling, returning a list of TokenRigResult.
+
+    Runs on the dedicated GPU thread under ``gpu_lock``. Does not touch bpy; the
+    produced assets are plain numpy, so export can later run on the bpy thread
+    while the next request's inference overlaps here.
+    """
+    from torch import Tensor
+    from src.model.tokenrig import TokenRigResult
+
+    cancellation.raise_if_cancelled()
+    if progress_callback:
+        progress_callback(10, "running inference")
+
+    batch = {
+        k: v.to(state.model.device, non_blocking=True) if isinstance(v, Tensor) else v
+        for k, v in batch.items()
+    }
+
+    if not params.use_skeleton:
+        batch.pop("skeleton_tokens", None)
+        batch.pop("skeleton_mask", None)
+
+    batch["generate_kwargs"] = dict(
+        max_new_tokens=2048,
+        top_k=params.top_k,
+        top_p=params.top_p,
+        temperature=params.temperature,
+        repetition_penalty=params.repetition_penalty,
+        num_beams=params.num_beams,
+        num_samples=params.num_samples,
+        do_sample=True,
+    )
+
+    if "skeleton_tokens" in batch and "skeleton_mask" in batch:
+        mask = batch["skeleton_mask"][0] == 1
+        skeleton_tokens = batch["skeleton_tokens"][0][mask].cpu().numpy()
+    else:
+        skeleton_tokens = None
+
+    cancellation.raise_if_cancelled()
+    if progress_callback:
+        progress_callback(10, "model sampling")
+
+    with _seeded_torch_rng(params.seed), torch.inference_mode():
+        preds: List[TokenRigResult] = state.model.predict_step(
+            batch,
+            skeleton_tokens=[skeleton_tokens] if skeleton_tokens is not None else None,
+            make_asset=True,
+            progress_callback=progress_callback if progress_callback else None,
+        )["results"]
+
+    cancellation.raise_if_cancelled()
+    return preds
+
+
+def _export_samples(
+    preds: list,
+    params: GenParams,
+    request_id: str,
+    cancellation: CancellationToken,
+    progress_callback,
+    tmp_output_dir: "Path",
+) -> list[bytes]:
+    """Stage 3 (bpy): export each predicted asset to a GLB on disk.
+
+    Runs on the dedicated bpy thread under ``bpy_lock``. Returns the raw GLB
+    bytes per sample; the remote renamer runs afterward outside any lock.
+    """
+    from src.data.vertex_group import voxel_skin
+    from src.rig_package.parser.bpy import transfer_rigging
+
+    sample_count = max(len(preds), 1)
+    glbs: list[bytes] = []
+
+    for sample_idx, pred in enumerate(preds):
         cancellation.raise_if_cancelled()
+        _report_sample_progress(progress_callback, sample_count, sample_idx, "start")
 
-        if progress_callback:
-            progress_callback(5, "building dataset")
-
-        datapath = {
-            "data_name": None,
-            "loader": "bpy",
-            "filepaths": {"articulation": [str(input_path)]},
-        }
-
-        dataset_config = DatasetConfig.parse(
-            shuffle=False,
-            batch_size=1,
-            num_workers=0,
-            pin_memory=DEVICE.startswith("cuda"),
-            persistent_workers=False,
-            datapath=datapath,
-        ).split_by_cls()
-
-        module = RigDatasetModule(
-            predict_dataset_config=dataset_config,
-            predict_transform=state.transform,
-            tokenizer=state.tokenizer,
-            process_fn=state.model._process_fn,
-        )
-
-        with _suppress_bpy_output():
-            dataloader = module.predict_dataloader()["articulation"]
-        cancellation.raise_if_cancelled()
-
-        if progress_callback:
-            progress_callback(10, "running inference")
-
-        batch_iterator = iter(dataloader)
-        while True:
-            with _suppress_bpy_output():
-                try:
-                    batch = next(batch_iterator)
-                except StopIteration:
-                    batch = None
-
-            if batch is None:
-                break
-
-            batch = {
-                k: v.to(state.model.device, non_blocking=True) if isinstance(v, Tensor) else v
-                for k, v in batch.items()
-            }
-
-            if not params.use_skeleton:
-                batch.pop("skeleton_tokens", None)
-                batch.pop("skeleton_mask", None)
-
-            if params.seed is not None:
-                torch.manual_seed(params.seed)
-                torch.cuda.manual_seed_all(params.seed)
-                np.random.seed(params.seed)
-                random.seed(params.seed)
-            batch["generate_kwargs"] = dict(
-                max_new_tokens=2048,
-                top_k=params.top_k,
-                top_p=params.top_p,
-                temperature=params.temperature,
-                repetition_penalty=params.repetition_penalty,
-                num_beams=params.num_beams,
-                num_samples=params.num_samples,
-                do_sample=True,
+        asset = pred.asset
+        assert asset is not None
+        collapsed_joints = asset.collapse_near_parent_joints()
+        if collapsed_joints:
+            logger.info(
+                "[%s] sample=%d collapsed near-parent skeleton joints: %s",
+                request_id,
+                sample_idx,
+                ", ".join(collapsed_joints),
             )
 
-            if "skeleton_tokens" in batch and "skeleton_mask" in batch:
-                mask = batch["skeleton_mask"][0] == 1
-                skeleton_tokens = batch["skeleton_tokens"][0][mask].cpu().numpy()
-            else:
-                skeleton_tokens = None
+        if params.use_postprocess:
+            voxel = asset.voxel(resolution=196)
+            asset.skin *= voxel_skin(
+                grid=0,
+                grid_coords=voxel.coords,
+                joints=asset.joints,
+                vertices=asset.vertices,
+                faces=asset.faces,
+                mode="square",
+                voxel_size=voxel.voxel_size,
+            )
+            asset.normalize_skin()
 
-            cancellation.raise_if_cancelled()
-            if progress_callback:
-                progress_callback(10, "model sampling")
+        sample_out_path = tmp_output_dir / f"sample_{sample_idx}.glb"
+        sample_out_path.parent.mkdir(parents=True, exist_ok=True)
 
-            with torch.inference_mode():
-                preds: List[TokenRigResult] = state.model.predict_step(
-                    batch,
-                    skeleton_tokens=[skeleton_tokens] if skeleton_tokens is not None else None,
-                    make_asset=True,
-                    progress_callback=progress_callback if progress_callback else None,
-                )["results"]
+        with _suppress_bpy_output():
+            transfer_rigging(
+                source_asset=asset,
+                target_path=asset.path,
+                export_path=str(sample_out_path),
+                group_per_vertex=4,
+                auto_ground=True,
+            )
 
-            cancellation.raise_if_cancelled()
-            # --- Export each sample as a separate GLB ---
-            all_glbs: list[tuple[bytes, dict]] = []
-            from src.rig_package.parser.bpy import transfer_rigging
-            sample_count = max(len(preds), 1)
-            sample_progress_start = 75
-            sample_progress_span = 24
+        glb_data = sample_out_path.read_bytes()
+        cancellation.raise_if_cancelled()
+        _report_sample_progress(progress_callback, sample_count, sample_idx, "exported")
+        glbs.append(glb_data)
 
-            def report_sample_progress(sample_idx: int, phase: str) -> None:
-                if not progress_callback:
-                    return
-                base = sample_progress_start + (sample_progress_span * sample_idx) // sample_count
-                done = sample_progress_start + (
-                    sample_progress_span * (sample_idx + 1)
-                ) // sample_count
-                mid = base + max(1, (done - base) // 2)
-                sample_label = f"sample {sample_idx + 1}/{sample_count}"
-                if phase == "start":
-                    if sample_idx > 0:
-                        return
-                    step = f"exporting {sample_label}"
-                    percent = base
-                elif phase == "exported":
-                    step = f"exported {sample_label}"
-                    percent = min(mid, done - 1)
-                elif phase == "renaming":
-                    step = f"renaming {sample_label}"
-                    percent = base + round((done - base) * 0.9)
-                elif phase == "complete":
-                    step = f"finished {sample_label}"
-                    percent = done
-                else:
-                    raise ValueError(f"unknown sample progress phase: {phase}")
-                progress_callback(percent, step)
-
-            for sample_idx, pred in enumerate(preds):
-                cancellation.raise_if_cancelled()
-                report_sample_progress(sample_idx, "start")
-
-                asset = pred.asset
-                assert asset is not None
-                collapsed_joints = asset.collapse_near_parent_joints()
-                if collapsed_joints:
-                    logger.info(
-                        "[%s] sample=%d collapsed near-parent skeleton joints: %s",
-                        request_id,
-                        sample_idx,
-                        ", ".join(collapsed_joints),
-                    )
-
-                if params.use_postprocess:
-                    voxel = asset.voxel(resolution=196)
-                    asset.skin *= voxel_skin(
-                        grid=0,
-                        grid_coords=voxel.coords,
-                        joints=asset.joints,
-                        vertices=asset.vertices,
-                        faces=asset.faces,
-                        mode="square",
-                        voxel_size=voxel.voxel_size,
-                    )
-                    asset.normalize_skin()
-
-                sample_out_path = tmp_output_dir / f"sample_{sample_idx}.glb"
-                sample_out_path.parent.mkdir(parents=True, exist_ok=True)
-
-                with _suppress_bpy_output():
-                    transfer_rigging(
-                        source_asset=asset,
-                        target_path=asset.path,
-                        export_path=str(sample_out_path),
-                        group_per_vertex=4,
-                        auto_ground=True,
-                    )
-
-                glb_data = sample_out_path.read_bytes()
-                cancellation.raise_if_cancelled()
-                report_sample_progress(sample_idx, "exported")
-
-                if params.skip_renamer:
-                    logger.info("[%s] sample=%d skipping skeleton renamer", request_id, sample_idx)
-                    all_glbs.append((glb_data, {}))
-                else:
-                    report_sample_progress(sample_idx, "renaming")
-                    renamed_data, renamer_meta = _run_skeleton_rename(
-                        glb_data,
-                        file_name=filename,
-                        conf_thresh=0.8,
-                        request_id=request_id,
-                    )
-                    all_glbs.append((renamed_data, renamer_meta))
-                report_sample_progress(sample_idx, "complete")
-
-            if progress_callback:
-                progress_callback(100, "complete")
-
-            return all_glbs
-
-        raise RuntimeError("No data in dataloader")
-    finally:
-        # Cleanup temp files
-        import shutil
-        with suppress(OSError):
-            shutil.rmtree(tmp_input_dir, ignore_errors=True)
-        with suppress(OSError):
-            shutil.rmtree(tmp_output_dir, ignore_errors=True)
+    return glbs
 
 
-def _run_skeleton_rename(
+async def _run_skeleton_rename_async(
     glb_data: bytes,
     file_name: str,
     conf_thresh: float,
     request_id: str,
+    cancellation: CancellationToken,
 ) -> tuple[bytes, dict]:
     """Send GLB data to the remote skeleton renamer service via WebSocket and
     return the renamed GLB bytes.
+
+    Runs natively on the event loop (no nested ``asyncio.run`` / worker thread)
+    and outside the bpy/GPU locks, so multiple renames proceed in parallel —
+    bounded by ``state.renamer_sem``. Each call owns its own WebSocket, so there
+    is no shared state between concurrent renames.
     """
-    import asyncio as _asyncio
     import json as _json
 
     ws_url = SKELETON_RENAMER_URL.rstrip("/")
@@ -613,12 +674,33 @@ def _run_skeleton_rename(
 
     logger.info("[%s] calling skeleton renamer at %s (file=%s, conf_thresh=%.2f)",
                 request_id, ws_url, file_name, conf_thresh)
+
+    rename_task = asyncio.create_task(_rename())
+    cancel_task = asyncio.create_task(cancellation.wait())
     try:
-        renamed, renamer_meta = _asyncio.run(_rename())
-        return renamed, renamer_meta
+        await asyncio.wait(
+            (rename_task, cancel_task), return_when=asyncio.FIRST_COMPLETED
+        )
+        if cancellation.cancelled:
+            rename_task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await rename_task
+            cancellation.raise_if_cancelled()
+        return rename_task.result()
+    except GenerationCancelled:
+        raise
     except Exception:
         logger.error("[%s] skeleton renamer failed", request_id)
         raise
+    finally:
+        if not rename_task.done():
+            rename_task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await rename_task
+        if not cancel_task.done():
+            cancel_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await cancel_task
 
 
 class ProgressReporter:
@@ -673,24 +755,125 @@ async def _generate(
     cancellation = cancellation or CancellationToken()
     reporter = ProgressReporter(request_id, cancellation, progress_callback)
 
-    queued = state.generation_lock.locked()
-    logger.info("[%s] queued=%s filename=%r", request_id, queued, filename)
-    wait_started = time.monotonic()
+    suffix = Path(filename).suffix.lower()
+    if suffix not in SUPPORTED_EXT:
+        raise ValueError(
+            f"Unsupported file format: {suffix}. Supported: {SUPPORTED_EXT}"
+        )
 
-    async with _acquire_or_cancel(state.generation_lock, cancellation):
-        state.busy = True
-        logger.info("[%s] generation lock acquired after %.2fs", request_id,
-                    time.monotonic() - wait_started)
-        try:
-            results = await _to_thread_cancellable(
-                _run_generation, file_data, filename, params, request_id,
-                cancellation, reporter.report,
+    bpy_queued = state.bpy_lock.locked()
+    gpu_queued = state.gpu_lock.locked()
+    logger.info("[%s] queued bpy=%s gpu=%s filename=%r",
+                request_id, bpy_queued, gpu_queued, filename)
+
+    tmp_input_dir = Path(tempfile.mkdtemp(prefix="skintokens_input_"))
+    tmp_output_dir = Path(tempfile.mkdtemp(prefix="skintokens_output_"))
+    input_path = tmp_input_dir / filename
+    state.active_jobs += 1
+    try:
+        input_path.write_bytes(file_data)
+        cancellation.raise_if_cancelled()
+
+        # --- Stage 1: parse input geometry (bpy, serialized) ---
+        wait_started = time.monotonic()
+        async with _acquire_or_cancel(state.bpy_lock, cancellation):
+            logger.info("[%s] bpy lock acquired (parse) after %.2fs",
+                        request_id, time.monotonic() - wait_started)
+            batch = await _to_thread_cancellable(
+                state.bpy_executor, _prepare_inputs,
+                input_path, params, request_id, cancellation, reporter.report,
                 cancellation=cancellation,
             )
-        finally:
-            state.busy = False
 
-    return results
+        # --- Stage 2: GPU inference (single instance, serialized) ---
+        wait_started = time.monotonic()
+        async with _acquire_or_cancel(state.gpu_lock, cancellation):
+            logger.info("[%s] gpu lock acquired after %.2fs",
+                        request_id, time.monotonic() - wait_started)
+            preds = await _to_thread_cancellable(
+                state.gpu_executor, _run_inference,
+                batch, params, request_id, cancellation, reporter.report,
+                cancellation=cancellation,
+            )
+
+        # --- Stage 3: export each sample to GLB (bpy, serialized) ---
+        wait_started = time.monotonic()
+        async with _acquire_or_cancel(state.bpy_lock, cancellation):
+            logger.info("[%s] bpy lock acquired (export) after %.2fs",
+                        request_id, time.monotonic() - wait_started)
+            glbs = await _to_thread_cancellable(
+                state.bpy_executor, _export_samples,
+                preds, params, request_id, cancellation, reporter.report,
+                tmp_output_dir,
+                cancellation=cancellation,
+            )
+
+        # --- Stage 4: skeleton rename (remote, runs in parallel, no lock) ---
+        results = await _run_renamers(
+            glbs, filename, params, request_id, cancellation, reporter
+        )
+        reporter.report(100, "complete")
+        return results
+    finally:
+        state.active_jobs -= 1
+        with suppress(OSError):
+            shutil.rmtree(tmp_input_dir, ignore_errors=True)
+        with suppress(OSError):
+            shutil.rmtree(tmp_output_dir, ignore_errors=True)
+
+
+async def _run_renamers(
+    glbs: list[bytes],
+    filename: str,
+    params: GenParams,
+    request_id: str,
+    cancellation: CancellationToken,
+    reporter: "ProgressReporter",
+) -> list[tuple[bytes, dict]]:
+    """Run the remote skeleton renamer for each sample concurrently.
+
+    Each sample is an independent remote call gated by ``state.renamer_sem``;
+    results preserve sample order. With ``skip_renamer`` the GLBs pass through
+    unchanged.
+    """
+    sample_count = max(len(glbs), 1)
+
+    if params.skip_renamer:
+        for sample_idx in range(len(glbs)):
+            logger.info("[%s] sample=%d skipping skeleton renamer",
+                        request_id, sample_idx)
+            _report_sample_progress(
+                reporter.report, sample_count, sample_idx, "complete"
+            )
+        return [(glb, {}) for glb in glbs]
+
+    async def _rename_one(sample_idx: int, glb: bytes) -> tuple[bytes, dict]:
+        async with state.renamer_sem:
+            cancellation.raise_if_cancelled()
+            _report_sample_progress(
+                reporter.report, sample_count, sample_idx, "renaming"
+            )
+            renamed, meta = await _run_skeleton_rename_async(
+                glb, filename, 0.8, request_id, cancellation,
+            )
+            _report_sample_progress(
+                reporter.report, sample_count, sample_idx, "complete"
+            )
+            return renamed, meta
+
+    tasks = [
+        asyncio.create_task(_rename_one(idx, glb))
+        for idx, glb in enumerate(glbs)
+    ]
+    try:
+        return await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        with suppress(BaseException):
+            await asyncio.gather(*tasks, return_exceptions=True)
+        raise
 
 
 async def _watch_ws_cancellation(
@@ -730,9 +913,12 @@ async def lifespan(app: FastAPI):
         state.tokenizer = None
         state.transform = None
         state.ready = False
-        if state.generation_executor is not None:
-            state.generation_executor.shutdown(wait=False, cancel_futures=True)
-            state.generation_executor = None
+        if state.bpy_executor is not None:
+            state.bpy_executor.shutdown(wait=False, cancel_futures=True)
+            state.bpy_executor = None
+        if state.gpu_executor is not None:
+            state.gpu_executor.shutdown(wait=False, cancel_futures=True)
+            state.gpu_executor = None
         torch.cuda.empty_cache()
 
 
@@ -744,7 +930,13 @@ app = FastAPI(title="SkinTokens / TokenRig Inference Server", version="1.0",
 async def health():
     if not state.ready:
         return JSONResponse({"status": "loading"}, status_code=503)
-    return {"status": "ok", "busy": state.busy}
+    return {
+        "status": "ok",
+        "busy": state.busy,
+        "active_jobs": state.active_jobs,
+        "gpu_busy": state.gpu_lock.locked(),
+        "bpy_busy": state.bpy_lock.locked(),
+    }
 
 
 @app.websocket("/ws/generate")
@@ -797,12 +989,29 @@ async def ws_generate(ws: WebSocket):
         loop = asyncio.get_running_loop()
         cancellation = CancellationToken()
 
+        async def _safe_ws_send(message):
+            try:
+                await ws.send_json(message)
+            except Exception:
+                cancellation.cancel("WebSocket client disconnected")
+
         def send_progress(percent, stage, elapsed):
             message = {
                 "stage": "processing", "step": stage,
                 "progress": percent, "elapsed_sec": elapsed,
                 "request_id": request_id,
             }
+            # Progress is reported both from worker threads (parse/infer/export)
+            # and from the event loop itself (the renamer stage). Blocking on
+            # run_coroutine_threadsafe from the loop thread would deadlock, so
+            # detect that case and schedule the send instead.
+            try:
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                running_loop = None
+            if running_loop is loop:
+                loop.create_task(_safe_ws_send(message))
+                return
             future = asyncio.run_coroutine_threadsafe(ws.send_json(message), loop)
             try:
                 future.result(timeout=5)
@@ -810,7 +1019,7 @@ async def ws_generate(ws: WebSocket):
                 future.cancel()
                 cancellation.cancel("WebSocket client disconnected")
 
-        queued = state.generation_lock.locked()
+        queued = state.bpy_lock.locked() or state.gpu_lock.locked()
         logger.info("[%s] queued=%s", request_id, queued)
         await ws.send_json({
             "stage": "queued", "queued": queued, "request_id": request_id
