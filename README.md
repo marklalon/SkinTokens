@@ -173,7 +173,6 @@ and containers.
 | `--repetition_penalty` | 1.0 | Repetition penalty |
 | `--num_beams` | 5 | Number of beams for beam search |
 | `--use_skeleton` | False | Use existing skeleton (generate skin only) |
-| `--use_postprocess` | False | Apply voxel-based skin postprocessing |
 
 ### Troubleshooting
 

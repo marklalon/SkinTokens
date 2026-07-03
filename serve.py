@@ -304,7 +304,6 @@ class GenParams(BaseModel):
     num_samples: int = Field(default=1, ge=1, le=8)
     seed: int | None = None
     use_skeleton: bool = False
-    use_postprocess: bool = False
     skip_renamer: bool = False
 
 
@@ -559,7 +558,6 @@ def _export_samples(
     Runs on the dedicated bpy thread under ``bpy_lock``. Returns the raw GLB
     bytes per sample; the remote renamer runs afterward outside any lock.
     """
-    from src.data.vertex_group import voxel_skin
     from src.rig_package.parser.bpy import transfer_rigging
 
     sample_count = max(len(preds), 1)
@@ -579,19 +577,6 @@ def _export_samples(
                 sample_idx,
                 ", ".join(collapsed_joints),
             )
-
-        if params.use_postprocess:
-            voxel = asset.voxel(resolution=196)
-            asset.skin *= voxel_skin(
-                grid=0,
-                grid_coords=voxel.coords,
-                joints=asset.joints,
-                vertices=asset.vertices,
-                faces=asset.faces,
-                mode="square",
-                voxel_size=voxel.voxel_size,
-            )
-            asset.normalize_skin()
 
         sample_out_path = tmp_output_dir / f"sample_{sample_idx}.glb"
         sample_out_path.parent.mkdir(parents=True, exist_ok=True)

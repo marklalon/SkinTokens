@@ -13,7 +13,6 @@ from src.data.transform import Transform
 from src.model.tokenrig import TokenRigResult
 from src.tokenizer.parse import get_tokenizer
 from src.server.spec import get_model
-from src.data.vertex_group import voxel_skin
 from src.paths import EXPERIMENTS_DIR
 from src.rig_package.parser.bpy import transfer_rigging
 
@@ -77,7 +76,6 @@ def run_rig(
     repetition_penalty: float,
     num_beams: int,
     use_skeleton: bool,
-    use_postprocess: bool,
     output_paths: List[Path],
     model_ckpt: str,
     hf_path: Optional[str],
@@ -151,19 +149,6 @@ def run_rig(
         if collapsed_joints:
             print(f"[postprocess] Collapsed near-parent joints: {', '.join(collapsed_joints)}")
 
-        if use_postprocess:
-            voxel = asset.voxel(resolution=196)
-            asset.skin *= voxel_skin(
-                grid=0,
-                grid_coords=voxel.coords,
-                joints=asset.joints,
-                vertices=asset.vertices,
-                faces=asset.faces,
-                mode="square",
-                voxel_size=voxel.voxel_size,
-            )
-            asset.normalize_skin()
-
         out_path = output_paths[i]
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -209,7 +194,6 @@ def run_cli(args):
         args.repetition_penalty,
         args.num_beams,
         args.use_skeleton,
-        args.use_postprocess,
         outputs,
         args.model_ckpt,
         args.hf_path,
@@ -228,7 +212,6 @@ if __name__ == "__main__":
     parser.add_argument("--num_beams", type=int, default=8)
 
     parser.add_argument("--use_skeleton", action="store_true")
-    parser.add_argument("--use_postprocess", action="store_true")
 
     parser.add_argument("--model_ckpt", default=MODEL_CKPTS[0] if MODEL_CKPTS else "")
     parser.add_argument("--hf_path", default=None)

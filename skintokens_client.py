@@ -2,8 +2,7 @@
 
 Example:
     python skintokens_client.py --input assets/character.obj --output out.glb
-    python skintokens_client.py --input model.fbx --server http://HOST:8087 \
-        --use-skeleton --use-postprocess
+    python skintokens_client.py --input model.fbx --server http://HOST:8087 --use-skeleton
 
 Requires the ``websockets`` package.
 """
@@ -89,7 +88,6 @@ async def _run(args) -> None:
         "seed": args.seed,
         "do_sample": True,
         "use_skeleton": args.use_skeleton,
-        "use_postprocess": args.use_postprocess,
         "skip_renamer": args.skip_renamer,
     }
 
@@ -194,7 +192,6 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducible generation")
 
     parser.add_argument("--use-skeleton", action="store_true", help="Use skeleton for skin generation")
-    parser.add_argument("--use-postprocess", action="store_true", help="Use postprocess (voxel skin)")
     parser.add_argument("--skip-renamer", action="store_true", help="Skip the skeleton renamer step")
 
     parser.add_argument("--timeout", type=int, default=30, help="Connection timeout seconds")
