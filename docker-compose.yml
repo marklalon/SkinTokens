@@ -7,6 +7,7 @@ services:
         BASE_IMAGE: ${SKINTOKENS_BASE_IMAGE:-base-cuda:cu128-torch2.7.1}
     image: skintokens:cu128-torch2.7.1
     container_name: skintokens
+    restart: unless-stopped
     runtime: nvidia
     environment:
       TZ: Asia/Shanghai
