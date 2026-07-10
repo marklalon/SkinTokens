@@ -19,6 +19,11 @@ services:
       SKINTOKENS_HOST: 0.0.0.0
       SKINTOKENS_PORT: 8000
       SKINTOKENS_SKELETON_RENAMER_URL: http://pcvg:8000
+      SKINTOKENS_DEFAULT_NUM_BEAMS: 8
+      SKINTOKENS_DEFAULT_NUM_SAMPLES: 1
+      SKINTOKENS_MAX_NEW_TOKENS: 2048
+      SKINTOKENS_USE_CACHE: 1
+      SKINTOKENS_EMPTY_CACHE_AFTER_INFERENCE: 1
       HF_HOME: /cache/huggingface
       TORCH_HOME: /cache/torch
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
@@ -31,7 +36,7 @@ services:
     working_dir: /workspace/SkinTokens
     ports:
       - "8087:8000"
-    shm_size: 8gb
+    shm_size: 1gb
     command: ["python", "serve.py"]
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]

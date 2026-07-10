@@ -6,6 +6,7 @@ from omegaconf import OmegaConf
 from typing import Dict, List, Optional, final
 from torch import Tensor
 
+import gc
 import numpy as np
 import lightning.pytorch as pl
 import torch
@@ -105,6 +106,8 @@ class ModelSpec(pl.LightningModule, ABC):
             print(f"[Warning] Missing keys: {missing}")
             print(f"[Warning] Unexpected keys: {unexpected}")
         model.on_load_checkpoint(ckpt)
+        del ckpt, state_dict, new_state_dict
+        gc.collect()
         return model
     
     def get_train_transform(self) -> Transform|None:

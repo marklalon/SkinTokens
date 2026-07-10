@@ -31,6 +31,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import argparse
 import asyncio
+import gc
 import json
 import logging
 import numpy as np
@@ -98,6 +99,41 @@ SKELETON_RENAMER_URL = os.environ.get(
 # run in parallel — bounded only to avoid overwhelming the remote service.
 RENAMER_CONCURRENCY = max(
     1, int(os.environ.get("SKINTOKENS_RENAMER_CONCURRENCY", "4"))
+)
+
+
+def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using default %d", name, raw, default)
+        return default
+    if value < minimum or value > maximum:
+        clamped = min(max(value, minimum), maximum)
+        logger.warning(
+            "Clamped %s=%d to %d (allowed %d..%d)",
+            name, value, clamped, minimum, maximum,
+        )
+        return clamped
+    return value
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+DEFAULT_NUM_BEAMS = _env_int("SKINTOKENS_DEFAULT_NUM_BEAMS", 8, 1, 16)
+DEFAULT_NUM_SAMPLES = _env_int("SKINTOKENS_DEFAULT_NUM_SAMPLES", 1, 1, 8)
+MAX_NEW_TOKENS = _env_int("SKINTOKENS_MAX_NEW_TOKENS", 2048, 128, 4096)
+USE_GENERATION_CACHE = _env_flag("SKINTOKENS_USE_CACHE", True)
+EMPTY_CACHE_AFTER_INFERENCE = _env_flag(
+    "SKINTOKENS_EMPTY_CACHE_AFTER_INFERENCE", True
 )
 
 
@@ -300,8 +336,8 @@ class GenParams(BaseModel):
     top_p: float = 0.95
     temperature: float = 1.0
     repetition_penalty: float = 1.0
-    num_beams: int = Field(default=8, ge=1, le=16)
-    num_samples: int = Field(default=1, ge=1, le=8)
+    num_beams: int = Field(default=DEFAULT_NUM_BEAMS, ge=1, le=16)
+    num_samples: int = Field(default=DEFAULT_NUM_SAMPLES, ge=1, le=8)
     seed: int | None = None
     use_skeleton: bool = False
     skip_renamer: bool = False
@@ -513,7 +549,7 @@ def _run_inference(
         batch.pop("skeleton_mask", None)
 
     batch["generate_kwargs"] = dict(
-        max_new_tokens=2048,
+        max_new_tokens=MAX_NEW_TOKENS,
         top_k=params.top_k,
         top_p=params.top_p,
         temperature=params.temperature,
@@ -521,6 +557,7 @@ def _run_inference(
         num_beams=params.num_beams,
         num_samples=params.num_samples,
         do_sample=True,
+        use_cache=USE_GENERATION_CACHE,
     )
 
     if "skeleton_tokens" in batch and "skeleton_mask" in batch:
@@ -540,6 +577,22 @@ def _run_inference(
             make_asset=True,
             progress_callback=progress_callback if progress_callback else None,
         )["results"]
+
+    import dataclasses
+
+    preds = [
+        dataclasses.replace(
+            pred,
+            cond=None, cond_latents=None,
+            input_ids=None, output_ids=None, skin_pred=None,
+        )
+        for pred in preds
+    ]
+
+    del batch
+    if EMPTY_CACHE_AFTER_INFERENCE and torch.cuda.is_available():
+        gc.collect()
+        torch.cuda.empty_cache()
 
     cancellation.raise_if_cancelled()
     return preds
@@ -757,6 +810,7 @@ async def _generate(
     state.active_jobs += 1
     try:
         input_path.write_bytes(file_data)
+        del file_data
         cancellation.raise_if_cancelled()
 
         # --- Stage 1: parse input geometry (bpy, serialized) ---
@@ -780,6 +834,7 @@ async def _generate(
                 batch, params, request_id, cancellation, reporter.report,
                 cancellation=cancellation,
             )
+        del batch
 
         # --- Stage 3: export each sample to GLB (bpy, serialized) ---
         wait_started = time.monotonic()
@@ -792,11 +847,13 @@ async def _generate(
                 tmp_output_dir,
                 cancellation=cancellation,
             )
+        del preds
 
         # --- Stage 4: skeleton rename (remote, runs in parallel, no lock) ---
         results = await _run_renamers(
             glbs, filename, params, request_id, cancellation, reporter
         )
+        del glbs
         reporter.report(100, "complete")
         return results
     finally:

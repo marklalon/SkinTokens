@@ -13,6 +13,7 @@ from typing import Callable, Dict, List, Tuple
 
 import math
 import numpy as np
+import os
 import torch
 import torch.nn.functional as F
 
@@ -208,10 +209,12 @@ class TokenRig(ModelSpec):
         llm_config.dtype = torch.bfloat16
         llm_config.pre_norm = True
         self.llm_config = llm_config
-        # Build directly on GPU in bfloat16: ~600M params never touch CPU
-        # memory, avoiding both the float32→bfloat16 conversion and the
-        # later model.to(device) transfer.
-        with torch.device("cuda"):
+        # Build directly on the target device in bfloat16 so the ~600M LLM
+        # parameters do not require an extra float32 copy during startup.
+        llm_init_device = os.environ.get(
+            "SKINTOKENS_DEVICE", "cuda" if torch.cuda.is_available() else "cpu"
+        )
+        with torch.device(llm_init_device):
             self.transformer = AutoModelForCausalLM.from_config(
                 config=llm_config, attn_implementation="flash_attention_2"
             )

@@ -142,7 +142,7 @@ $env:SKINTOKENS_BASE_IMAGE = "trellis2:base"
 docker compose build
 ```
 
-Open `http://127.0.0.1:1024`. To run command-line inference inside the same
+Open `http://127.0.0.1:8087`. To run command-line inference inside the same
 environment:
 
 ```powershell
@@ -154,6 +154,21 @@ Paths can be overridden with `SKINTOKENS_MODEL_ROOT`,
 `SKINTOKENS_EXPERIMENTS_DIR`, and `SKINTOKENS_DATA_ROOT`. This also makes saved
 checkpoint references such as `experiments/...` portable between host training
 and containers.
+
+Docker defaults to a lighter inference profile than the bare Python server:
+`SKINTOKENS_DEFAULT_NUM_BEAMS=4`, one sample, and CUDA cache release after each
+request. For the previous beam-search behavior, set:
+
+```powershell
+$env:SKINTOKENS_DEFAULT_NUM_BEAMS = "8"
+$env:SKINTOKENS_EMPTY_CACHE_AFTER_INFERENCE = "0"
+docker compose up -d
+```
+
+For lower peak VRAM at the cost of much slower autoregressive decoding, set
+`SKINTOKENS_USE_CACHE=0`. `/dev/shm` can be adjusted with
+`SKINTOKENS_SHM_SIZE`; the Compose default is `1gb` because inference uses
+single-worker dataloading.
 
 > [!NOTE]
 > This public repository currently contains no training launcher or training

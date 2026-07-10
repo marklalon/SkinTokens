@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from torch import Tensor
 from typing import Dict, Optional, List, Tuple
 
+import gc
 import io
 import os
 import torch
@@ -74,9 +75,14 @@ def get_model(
             dtype=torch.bfloat16,
         )
         model.transformer.model.load_state_dict(a.state_dict())
+        del a
+        gc.collect()
 
     model = model.to(device)
     if hasattr(model.transformer, "config") and hasattr(model.transformer.config, "use_cache"):
-        model.transformer.config.use_cache = True
+        raw_use_cache = os.environ.get("SKINTOKENS_USE_CACHE", "1")
+        model.transformer.config.use_cache = raw_use_cache.strip().lower() in {
+            "1", "true", "yes", "on"
+        }
     model.eval()
     return model
