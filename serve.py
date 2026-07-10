@@ -432,11 +432,11 @@ def _seeded_torch_rng(seed: int | None):
 def _report_sample_progress(
     progress_callback, sample_count: int, sample_idx: int, phase: str
 ) -> None:
-    """Map a per-sample export/rename phase to a percentage in the 75–99 band."""
+    """Map a per-sample export/rename phase to a percentage in the 85–99 band."""
     if not progress_callback:
         return
-    sample_progress_start = 75
-    sample_progress_span = 24
+    sample_progress_start = 85
+    sample_progress_span = 14
     base = sample_progress_start + (sample_progress_span * sample_idx) // sample_count
     done = sample_progress_start + (
         sample_progress_span * (sample_idx + 1)
@@ -744,7 +744,7 @@ async def _run_skeleton_rename_async(
 class ProgressReporter:
     """Per-request progress/timing."""
 
-    CLIENT_ONLY_STAGE_PREFIXES = ("model sampling",)
+    CLIENT_ONLY_STAGE_PREFIXES = ("model sampling", "decoding joints")
 
     def __init__(self, request_id: str, cancellation: CancellationToken,
                  progress_callback=None):

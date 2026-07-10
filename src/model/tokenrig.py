@@ -128,17 +128,50 @@ class SamplingProgressCriteria(StoppingCriteria):
     def __init__(
         self,
         progress_callback: Callable[[int, str], None] | None,
+        tokenizer: Tokenizer | None = None,
+        final_eos_token_id: int | None = None,
+        tokens_per_skin: int | None = None,
+        start_tokens: Tensor | List[int] | None = None,
         stage: str = "model sampling",
         progress_start: int = 10,
         progress_end: int = 74,
         estimated_total_tokens: int = 240,
     ) -> None:
         self.progress_callback = progress_callback
+        self.tokenizer = tokenizer
+        self.final_eos_token_id = final_eos_token_id
+        self.tokens_per_skin = tokens_per_skin
+        if isinstance(start_tokens, Tensor):
+            start_tokens = start_tokens.detach().cpu().numpy().tolist()
+        self.start_tokens = list(start_tokens) if start_tokens is not None else []
         self.stage = stage
         self.progress_start = progress_start
         self.estimated_total_tokens = max(1, estimated_total_tokens)
         self._max_sampling_progress = max(progress_start, progress_end - 1)
         self._last_percent = progress_start
+
+    def _estimated_generated_total(self, generated_ids: Tensor) -> int:
+        if (
+            self.tokenizer is None
+            or self.tokens_per_skin is None
+            or self.final_eos_token_id is None
+        ):
+            return self.estimated_total_tokens
+
+        generated = generated_ids.detach().cpu().numpy().astype(np.int64).tolist()
+        sequence = self.start_tokens + generated
+        try:
+            switch_pos = sequence.index(self.tokenizer.eos)
+        except ValueError:
+            return self.estimated_total_tokens
+
+        try:
+            joint_count = self.tokenizer.bones_in_sequence(ids=np.asarray(sequence))
+        except Exception:
+            return self.estimated_total_tokens
+
+        expected_total_sequence_tokens = switch_pos + 1 + joint_count * self.tokens_per_skin + 1
+        return max(1, expected_total_sequence_tokens - len(self.start_tokens))
 
     def _percent_for_tokens(self, token_count: int) -> int:
         if token_count <= 0:
@@ -154,7 +187,12 @@ class SamplingProgressCriteria(StoppingCriteria):
 
     def __call__(self, input_ids: Tensor, scores: FloatTensor, **kwargs) -> torch.BoolTensor:
         if self.progress_callback is not None:
-            token_count = int(input_ids.shape[1])
+            generated_ids = input_ids[0]
+            token_count = int(generated_ids.shape[0])
+            self.estimated_total_tokens = max(
+                token_count,
+                self._estimated_generated_total(generated_ids),
+            )
             percent = self._percent_for_tokens(token_count)
             if percent > self._last_percent:
                 self._last_percent = percent
@@ -374,8 +412,17 @@ class TokenRig(ModelSpec):
         # works with beam search.
         gen_kwargs = {k: v for k, v in kwargs.items() if k != 'repetition_penalty'}
         if progress_callback is not None:
+            max_new_tokens = int(gen_kwargs.get("max_new_tokens") or 240)
+            estimated_total_tokens = max(240, min(max_new_tokens, 512))
             gen_kwargs['stopping_criteria'] = StoppingCriteriaList([
-                SamplingProgressCriteria(progress_callback=progress_callback)
+                SamplingProgressCriteria(
+                    progress_callback=progress_callback,
+                    tokenizer=self.tokenizer,
+                    final_eos_token_id=self.eos,
+                    tokens_per_skin=self.tokens_per_skin,
+                    start_tokens=start_tokens[0],
+                    estimated_total_tokens=estimated_total_tokens,
+                )
             ])
 
         results = self.transformer.generate(
@@ -422,6 +469,7 @@ class TokenRig(ModelSpec):
                 tokenizer=self.tokenizer,
                 tokens_per_skin=self.tokens_per_skin,
                 vae=self.vae,
+                progress_callback=progress_callback,
             )
             res.skin_pred = d['skin_pred']
             res.detokenize_output = d['detokenize_output']
@@ -718,6 +766,9 @@ def decode(
     tokens_per_skin: int,
     vae: SkinVAEModel,
     encode_repeat: int=1,
+    progress_callback: Callable[[int, str], None] | None = None,
+    decode_progress_start: int = 74,
+    decode_progress_end: int = 84,
 ) -> Dict:
     """
     inputs_ids: (seq_len)
@@ -748,7 +799,9 @@ def decode(
     cond_latents = cond_latents.unsqueeze(0)
     skin = []
     g = tokens_per_skin * encode_repeat
-    for s in range(0, J*tokens_per_skin, g):
+    progress_span = max(1, decode_progress_end - decode_progress_start)
+    total_steps = max(1, (J * tokens_per_skin + g - 1) // g)
+    for step_idx, s in enumerate(range(0, J*tokens_per_skin, g)):
         t = min(s+g, J*tokens_per_skin)
         indices = skin_tokens[s:t].unsqueeze(0) - tokenizer.vocab_size
         # expect: (b, tokens_per_skin, dim)
@@ -758,6 +811,12 @@ def decode(
         logits = vae.decode(z=z, sampled_cond=cond.repeat(b, 1, 1), cond_tokens=cond_latents.repeat(b, 1, 1))
         skin_pred = logits.reshape(b, logits.shape[1]).permute(1, 0)
         skin.append(skin_pred)
+
+        if progress_callback is not None:
+            pct = decode_progress_start + (progress_span * (step_idx + 1)) // total_steps
+            joint_idx = min((t) // tokens_per_skin, J)
+            progress_callback(min(pct, decode_progress_end), f"decoding joints ({joint_idx}/{J})")
+
     skin = torch.concat(skin, dim=1).float()
     return {
         'skin_pred': skin,
