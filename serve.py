@@ -255,6 +255,25 @@ def _suppress_bpy_output():
 
 
 # --------------------------------------------------------------------------- #
+# Queue-position accounting (live lock heartbeat)
+# --------------------------------------------------------------------------- #
+class _PhaseQueue:
+    """Live queue-position accounting for one phase lock.
+
+    ``enqueued`` dispenses a ticket to each request as it starts waiting for the
+    lock; ``released`` counts requests that have left the wait (acquired-then-
+    released, or abandoned it via cancel/disconnect). A waiter's queue_ahead is
+    ``ticket - released``, which reaches 0 exactly when it is next in line. Both
+    counters are only ever mutated from the single event-loop thread, so they
+    need no locking.
+    """
+
+    def __init__(self) -> None:
+        self.enqueued = 0
+        self.released = 0
+
+
+# --------------------------------------------------------------------------- #
 # Global state
 # --------------------------------------------------------------------------- #
 class ServerState:
@@ -275,6 +294,10 @@ class ServerState:
     active_jobs: int = 0
     bpy_lock: asyncio.Lock = asyncio.Lock()
     gpu_lock: asyncio.Lock = asyncio.Lock()
+    # Per-lock queue accounting so a waiting client gets a live "queue_ahead"
+    # heartbeat instead of a silent stall (see _acquire_or_cancel).
+    bpy_queue: "_PhaseQueue" = _PhaseQueue()
+    gpu_queue: "_PhaseQueue" = _PhaseQueue()
     # Remote renamer calls are independent network I/O — safe to run in parallel.
     renamer_sem: asyncio.Semaphore = asyncio.Semaphore(RENAMER_CONCURRENCY)
 
@@ -329,9 +352,59 @@ class CancellationToken:
 
 
 @asynccontextmanager
-async def _acquire_or_cancel(lock: asyncio.Lock, cancellation: CancellationToken):
-    """Acquire a lock, but immediately remove cancelled queued work."""
+async def _acquire_or_cancel(
+    lock: asyncio.Lock,
+    cancellation: CancellationToken,
+    lock_name: str = "lock",
+    queue: Optional["_PhaseQueue"] = None,
+    queue_callback=None,
+    queue_phase: str = "queued",
+):
+    """Acquire a phase lock, but immediately remove cancelled queued work.
+
+    Logs acquisition and release of the lock so lock contention is observable
+    in the server log.
+
+    When ``queue`` is supplied the wait is accounted against that queue's live
+    position counter, and if ``queue_callback`` (an async callable) is also
+    given, a once-per-second heartbeat streams ``(queue_phase, waited_sec,
+    queue_ahead)`` to the caller until the lock is acquired — so a waiting
+    client sees progress instead of a silent stall. The queue slot is freed
+    (``queue.released``) once the request stops occupying the lock, whether it
+    acquired-then-released it or abandoned the wait via cancellation.
+    """
     cancellation.raise_if_cancelled()
+    acquire_start = time.monotonic()
+
+    heartbeat_task = None
+    released_counted = False
+
+    def _release_slot() -> None:
+        nonlocal released_counted
+        if queue is not None and not released_counted:
+            released_counted = True
+            queue.released += 1
+
+    if queue is not None:
+        my_ticket = queue.enqueued
+        queue.enqueued += 1
+        if queue_callback is not None:
+            async def _heartbeat() -> None:
+                while True:
+                    await asyncio.sleep(1.0)
+                    ahead = max(0, my_ticket - queue.released)
+                    waited = round(time.monotonic() - acquire_start, 2)
+                    await queue_callback(queue_phase, waited, ahead)
+            heartbeat_task = asyncio.create_task(_heartbeat())
+
+    async def _stop_heartbeat() -> None:
+        nonlocal heartbeat_task
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat_task
+            heartbeat_task = None
+
     acquire_task = asyncio.create_task(lock.acquire())
     cancel_task = asyncio.create_task(cancellation.wait())
     lock_held = False
@@ -343,11 +416,15 @@ async def _acquire_or_cancel(lock: asyncio.Lock, cancellation: CancellationToken
             cancellation.raise_if_cancelled()
         await acquire_task
         lock_held = True
+        await _stop_heartbeat()
         cancel_task.cancel()
         with suppress(asyncio.CancelledError):
             await cancel_task
+        logger.info("%s acquired after %.2fs", lock_name,
+                    time.monotonic() - acquire_start)
         yield
     finally:
+        await _stop_heartbeat()
         if not acquire_task.done():
             acquire_task.cancel()
         try:
@@ -361,7 +438,10 @@ async def _acquire_or_cancel(lock: asyncio.Lock, cancellation: CancellationToken
         with suppress(asyncio.CancelledError):
             await cancel_task
         if lock_held:
+            logger.info("%s released (held=%.2fs)", lock_name,
+                        time.monotonic() - acquire_start)
             lock.release()
+        _release_slot()
 
 
 async def _to_thread_cancellable(
@@ -946,8 +1026,15 @@ async def _generate(
     request_id: str,
     progress_callback=None,
     cancellation: Optional[CancellationToken] = None,
+    queue_callback=None,
 ):
-    """Run generation with lock serialization.
+    """Run generation with lock serialization and queue-position heartbeats.
+
+    ``queue_callback`` (optional, async) is invoked once per second with
+    ``(phase, waited_sec, queue_ahead)`` while this request is waiting for
+    either lock, so a queued client gets a live heartbeat instead of a silent
+    stall. It runs on the event loop, so it must be a coroutine function (unlike
+    the thread-driven ``progress_callback``).
 
     Returns:
         List of (glb_bytes, renamer_meta) tuples, one per sample.
@@ -979,7 +1066,12 @@ async def _generate(
 
         # --- Stage 1: parse input geometry (bpy, serialized) ---
         wait_started = time.monotonic()
-        async with _acquire_or_cancel(state.bpy_lock, cancellation):
+        async with _acquire_or_cancel(
+            state.bpy_lock, cancellation,
+            lock_name=f"[{request_id}] bpy_lock (parse)",
+            queue=state.bpy_queue, queue_callback=queue_callback,
+            queue_phase="bpy",
+        ):
             logger.info("[%s] bpy lock acquired (parse) after %.2fs",
                         request_id, time.monotonic() - wait_started)
             batch = await _to_thread_cancellable(
@@ -990,7 +1082,12 @@ async def _generate(
 
         # --- Stage 2: GPU inference (single instance, serialized) ---
         wait_started = time.monotonic()
-        async with _acquire_or_cancel(state.gpu_lock, cancellation):
+        async with _acquire_or_cancel(
+            state.gpu_lock, cancellation,
+            lock_name=f"[{request_id}] gpu_lock",
+            queue=state.gpu_queue, queue_callback=queue_callback,
+            queue_phase="gpu",
+        ):
             logger.info("[%s] gpu lock acquired after %.2fs",
                         request_id, time.monotonic() - wait_started)
             preds = await _to_thread_cancellable(
@@ -1002,7 +1099,12 @@ async def _generate(
 
         # --- Stage 3: export each sample to GLB (bpy, serialized) ---
         wait_started = time.monotonic()
-        async with _acquire_or_cancel(state.bpy_lock, cancellation):
+        async with _acquire_or_cancel(
+            state.bpy_lock, cancellation,
+            lock_name=f"[{request_id}] bpy_lock (export)",
+            queue=state.bpy_queue, queue_callback=queue_callback,
+            queue_phase="bpy",
+        ):
             logger.info("[%s] bpy lock acquired (export) after %.2fs",
                         request_id, time.monotonic() - wait_started)
             glbs = await _to_thread_cancellable(
@@ -1142,6 +1244,10 @@ async def health():
         "active_jobs": state.active_jobs,
         "gpu_busy": state.gpu_lock.locked(),
         "bpy_busy": state.bpy_lock.locked(),
+        "queue_depth": {
+            "bpy": max(0, state.bpy_queue.enqueued - state.bpy_queue.released),
+            "gpu": max(0, state.gpu_queue.enqueued - state.gpu_queue.released),
+        },
     }
 
 
@@ -1225,6 +1331,20 @@ async def ws_generate(ws: WebSocket):
                 future.cancel()
                 cancellation.cancel("WebSocket client disconnected")
 
+        async def send_queue(phase, waited_sec, queue_ahead):
+            """Live queue-position heartbeat sent once per second while waiting
+            for a phase lock. Runs on the event loop (from the heartbeat task in
+            _acquire_or_cancel), so it sends directly rather than round-tripping
+            through run_coroutine_threadsafe."""
+            try:
+                await ws.send_json({
+                    "stage": "queued", "phase": phase, "queued": True,
+                    "waited_sec": waited_sec, "queue_ahead": queue_ahead,
+                    "request_id": request_id,
+                })
+            except Exception:
+                cancellation.cancel("WebSocket client disconnected")
+
         queued = state.bpy_lock.locked() or state.gpu_lock.locked()
         logger.info("[%s] queued=%s", request_id, queued)
         await ws.send_json({
@@ -1239,6 +1359,7 @@ async def ws_generate(ws: WebSocket):
             _generate(
                 file_data, filename, params, request_id, send_progress,
                 cancellation=cancellation,
+                queue_callback=send_queue,
             )
         )
         receiver_task = asyncio.create_task(
