@@ -128,13 +128,72 @@ def _env_flag(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-DEFAULT_NUM_BEAMS = _env_int("SKINTOKENS_DEFAULT_NUM_BEAMS", 8, 1, 16)
+DEFAULT_NUM_BEAMS = _env_int("SKINTOKENS_DEFAULT_NUM_BEAMS", 1, 1, 8)
 DEFAULT_NUM_SAMPLES = _env_int("SKINTOKENS_DEFAULT_NUM_SAMPLES", 1, 1, 8)
 MAX_NEW_TOKENS = _env_int("SKINTOKENS_MAX_NEW_TOKENS", 2048, 128, 4096)
 USE_GENERATION_CACHE = _env_flag("SKINTOKENS_USE_CACHE", True)
 EMPTY_CACHE_AFTER_INFERENCE = _env_flag(
     "SKINTOKENS_EMPTY_CACHE_AFTER_INFERENCE", True
 )
+# Fast decode: SDPA attention + static KV cache + CUDA-graph capture (Triton-free
+# ``cudagraphs`` backend) gives ~2x on the autoregressive sampling stage, which
+# dominates wall time. It requires ``num_beams == 1`` (a static cache cannot do
+# beam reordering); beam requests transparently fall back to the original
+# flash-attention + dynamic-cache path. See _run_inference.
+FAST_DECODE = _env_flag("SKINTOKENS_FAST_DECODE", False)
+# Compile backend for the fast decode path:
+#   "cudagraphs" (default) — Triton-free, CUDA-graph capture only (no op fusion),
+#                            works everywhere including Windows dev.
+#   "inductor"             — adds pointwise fusion (RMSNorm/RoPE/casts) on top of
+#                            CUDA graphs; faster, but requires Triton (available in
+#                            the Linux container, not on Windows).
+FAST_DECODE_BACKEND = os.environ.get(
+    "SKINTOKENS_FAST_DECODE_BACKEND", "cudagraphs"
+).strip().lower()
+
+_FLASH_ATTN_IMPL = "flash_attention_2"
+_SDPA_ATTN_IMPL = "sdpa"
+# Built lazily so a transformers build without CompileConfig disables fast decode
+# gracefully rather than failing at import time.
+_fast_decode_compile_config = None
+
+
+def _set_llm_attention(model, impl: str) -> None:
+    """Switch only the LLM transformer's attention backend.
+
+    The mesh encoder and VAE call ``flash_attn_func`` directly (not via config),
+    so they are unaffected; only Qwen3's config-dispatched attention changes.
+    Flash-attention mis-masks the pre-allocated static cache (it attends over the
+    unfilled slots), so the fast path must run SDPA. No-op if already set.
+    """
+    cfg = getattr(model.transformer, "config", None)
+    if cfg is not None and getattr(cfg, "_attn_implementation", None) == impl:
+        return
+    for module in model.transformer.modules():
+        mcfg = getattr(module, "config", None)
+        if mcfg is not None and hasattr(mcfg, "_attn_implementation"):
+            mcfg._attn_implementation = impl
+
+
+def _get_fast_decode_compile_config():
+    """Return a cached CompileConfig for the configured fast-decode backend."""
+    global _fast_decode_compile_config
+    if _fast_decode_compile_config is None:
+        from transformers import CompileConfig
+        if FAST_DECODE_BACKEND == "inductor":
+            # Inductor fuses pointwise ops; "reduce-overhead" layers CUDA graphs on
+            # top. Requires Triton. fullgraph stays False because data-dependent ops
+            # in the attention path introduce graph breaks.
+            _fast_decode_compile_config = CompileConfig(
+                backend="inductor", mode="reduce-overhead", fullgraph=False
+            )
+        else:
+            # Triton-free CUDA-graph capture (no fusion). The ``cudagraphs`` backend
+            # rejects the ``mode`` argument, so it must be left unset.
+            _fast_decode_compile_config = CompileConfig(
+                backend="cudagraphs", mode=None, fullgraph=False
+            )
+    return _fast_decode_compile_config
 
 
 def _run_startup_stage(label: str, operation):
@@ -336,7 +395,7 @@ class GenParams(BaseModel):
     top_p: float = 0.95
     temperature: float = 1.0
     repetition_penalty: float = 1.0
-    num_beams: int = Field(default=DEFAULT_NUM_BEAMS, ge=1, le=16)
+    num_beams: int = Field(default=DEFAULT_NUM_BEAMS, ge=1, le=8)
     num_samples: int = Field(default=DEFAULT_NUM_SAMPLES, ge=1, le=8)
     seed: int | None = None
     use_skeleton: bool = False
@@ -350,6 +409,72 @@ def _load_bpy_inproc():
     """Import bpy-backed parser on the dedicated generation thread."""
     with _suppress_bpy_output():
         from src.rig_package.parser.bpy import BpyParser  # noqa: F401
+
+
+def _prewarm_fast_decode() -> None:
+    """Trigger the fast-decode compile + CUDA-graph capture on a synthetic input.
+
+    The transformer's prefill/decode graph shapes are independent of the input
+    geometry (the mesh encoder emits a fixed number of condition tokens and the
+    no-skeleton prompt is just ``[bos, cls]``), so a random point cloud warms the
+    exact graphs real requests will replay. Must run on the GPU executor so the
+    graph is captured on the same thread/stream that later serves requests. Uses
+    the real ``MAX_NEW_TOKENS`` so the static-cache shape matches, but stops after
+    a handful of tokens (the graph is captured within the first few steps) and
+    skips VAE decode via ``only_ids`` since the truncated sequence isn't a rig.
+    """
+    model = state.model
+    if model is None:
+        return
+    try:
+        compile_config = _get_fast_decode_compile_config()
+    except Exception as exc:
+        logger.warning("Fast decode prewarm skipped (CompileConfig unavailable): %s", exc)
+        return
+
+    from transformers import StoppingCriteria, StoppingCriteriaList
+
+    class _StopAfter(StoppingCriteria):
+        def __init__(self, k: int) -> None:
+            self.k = k
+
+        def __call__(self, input_ids, scores, **kwargs):
+            done = bool(input_ids.shape[1] >= self.k)
+            return torch.full(
+                (input_ids.shape[0],), done, dtype=torch.bool, device=input_ids.device
+            )
+
+    _set_llm_attention(model, _SDPA_ATTN_IMPL)
+    device = model.device
+    n_pts = 8192
+    vertices = torch.rand(n_pts, 3, device=device) * 2.0 - 1.0
+    normals = torch.nn.functional.normalize(
+        torch.randn(n_pts, 3, device=device), dim=-1
+    )
+    batch = {
+        "vertices": vertices,
+        "normals": normals,
+        "cls": ["prewarm"],
+        "generate_kwargs": dict(
+            max_new_tokens=MAX_NEW_TOKENS,
+            num_beams=1,
+            num_samples=1,
+            do_sample=True,
+            top_k=5,
+            top_p=0.95,
+            temperature=1.0,
+            use_cache=USE_GENERATION_CACHE,
+            only_ids=True,
+            cache_implementation="static",
+            compile_config=compile_config,
+            stopping_criteria=StoppingCriteriaList([_StopAfter(32)]),
+        ),
+    }
+    # Two passes: the first pays the compile cost, the second confirms the graph
+    # is captured and replayable on this thread.
+    for _ in range(2):
+        with torch.inference_mode():
+            model.predict_step(batch, make_asset=False, progress_callback=None)
 
 
 def _load_pipeline():
@@ -393,6 +518,16 @@ def _load_pipeline():
     state.ready = True
     state.loaded_at = time.time()
     logger.info("Pipeline ready (fully resident in VRAM)")
+
+    # Prewarm the fast-decode graph so the first real request doesn't pay the
+    # one-time compile cost. Runs on the GPU executor to capture the CUDA graph on
+    # the thread that serves requests.
+    if FAST_DECODE:
+        def prewarm_fn():
+            assert state.gpu_executor is not None
+            state.gpu_executor.submit(_prewarm_fast_decode).result()
+
+        _run_startup_stage("prewarming fast decode", prewarm_fn)
 
 
 # --------------------------------------------------------------------------- #
@@ -548,7 +683,7 @@ def _run_inference(
         batch.pop("skeleton_tokens", None)
         batch.pop("skeleton_mask", None)
 
-    batch["generate_kwargs"] = dict(
+    generate_kwargs = dict(
         max_new_tokens=MAX_NEW_TOKENS,
         top_k=params.top_k,
         top_p=params.top_p,
@@ -559,6 +694,35 @@ def _run_inference(
         do_sample=True,
         use_cache=USE_GENERATION_CACHE,
     )
+
+    # Fast decode requires greedy/single-beam search; beam requests fall back to
+    # the original flash-attention + dynamic-cache path. The first fast request
+    # captures the CUDA graph (so it runs at ~baseline speed); every request after
+    # replays it at ~2x.
+    fast_decode = FAST_DECODE and params.num_beams == 1
+    if fast_decode:
+        try:
+            compile_config = _get_fast_decode_compile_config()
+        except Exception:
+            logger.warning(
+                "[%s] fast decode unavailable (CompileConfig import failed); "
+                "falling back to flash/dynamic path", request_id
+            )
+            fast_decode = False
+    if fast_decode:
+        _set_llm_attention(state.model, _SDPA_ATTN_IMPL)
+        generate_kwargs.update(
+            cache_implementation="static",
+            compile_config=compile_config,
+        )
+        logger.info("[%s] fast decode enabled (sdpa + static cache + %s)",
+                    request_id, FAST_DECODE_BACKEND)
+    elif FAST_DECODE:
+        # A previous fast request may have switched the shared model to SDPA;
+        # restore flash-attention for the original path.
+        _set_llm_attention(state.model, _FLASH_ATTN_IMPL)
+
+    batch["generate_kwargs"] = generate_kwargs
 
     if "skeleton_tokens" in batch and "skeleton_mask" in batch:
         mask = batch["skeleton_mask"][0] == 1

@@ -209,7 +209,7 @@ if __name__ == "__main__":
     parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--repetition_penalty", type=float, default=1.0)
-    parser.add_argument("--num_beams", type=int, default=8)
+    parser.add_argument("--num_beams", type=int, default=1)
 
     parser.add_argument("--use_skeleton", action="store_true")
 

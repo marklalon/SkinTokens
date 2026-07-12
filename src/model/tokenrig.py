@@ -30,6 +30,12 @@ from ..paths import resolve_model_path
 
 LLM_LOCAL_DIR = resolve_model_path("models/Qwen3-0.6B")
 
+# Number of joints to decode per VAE call. Batching joints collapses the
+# per-joint decode loop (one tiny GPU launch each) into a few larger launches.
+# Each joint replicates the point-cloud condition once, so this is bounded to
+# keep peak VRAM in check; override via SKINTOKENS_DECODE_JOINT_BATCH.
+DECODE_JOINT_BATCH = max(1, int(os.environ.get("SKINTOKENS_DECODE_JOINT_BATCH", "8")))
+
 try:
     from flash_attn_interface import flash_attn_func # type: ignore
 except Exception:
@@ -149,6 +155,12 @@ class SamplingProgressCriteria(StoppingCriteria):
         self.estimated_total_tokens = max(1, estimated_total_tokens)
         self._max_sampling_progress = max(progress_start, progress_end - 1)
         self._last_percent = progress_start
+        # Refreshing the token-count estimate copies the whole growing sequence
+        # to CPU (O(n) per step -> O(n^2) over a full generation), so refresh it
+        # only periodically. token_count itself needs no device sync.
+        self._estimate_interval = 16
+        self._cached_estimate = estimated_total_tokens
+        self._last_estimate_token_count = -self._estimate_interval
 
     def _estimated_generated_total(self, generated_ids: Tensor) -> int:
         if (
@@ -189,10 +201,10 @@ class SamplingProgressCriteria(StoppingCriteria):
         if self.progress_callback is not None:
             generated_ids = input_ids[0]
             token_count = int(generated_ids.shape[0])
-            self.estimated_total_tokens = max(
-                token_count,
-                self._estimated_generated_total(generated_ids),
-            )
+            if token_count - self._last_estimate_token_count >= self._estimate_interval:
+                self._cached_estimate = self._estimated_generated_total(generated_ids)
+                self._last_estimate_token_count = token_count
+            self.estimated_total_tokens = max(token_count, self._cached_estimate)
             percent = self._percent_for_tokens(token_count)
             if percent > self._last_percent:
                 self._last_percent = percent
@@ -469,6 +481,7 @@ class TokenRig(ModelSpec):
                 tokenizer=self.tokenizer,
                 tokens_per_skin=self.tokens_per_skin,
                 vae=self.vae,
+                encode_repeat=DECODE_JOINT_BATCH,
                 progress_callback=progress_callback,
             )
             res.skin_pred = d['skin_pred']

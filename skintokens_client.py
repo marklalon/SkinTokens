@@ -187,7 +187,7 @@ def main() -> None:
     parser.add_argument("--top-p", type=float, default=0.95, help="Top-p sampling (default: 0.95)")
     parser.add_argument("--temperature", type=float, default=1.0, help="Temperature (default: 1.0)")
     parser.add_argument("--repetition-penalty", type=float, default=1.0, help="Repetition penalty (default: 1.0)")
-    parser.add_argument("--num-beams", type=int, default=8, help="Number of beams (1-16, default: 8)")
+    parser.add_argument("--num-beams", type=int, default=1, help="Number of beams (1-8, default: 1)")
     parser.add_argument("--num-samples", type=int, default=1, help="Number of parallel samples to generate (1-8, default: 1)")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducible generation")
 
