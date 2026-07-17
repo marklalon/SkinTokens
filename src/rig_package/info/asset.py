@@ -292,7 +292,7 @@ class Asset():
 
     def collapse_near_parent_joints(
         self,
-        distance_ratio: float=0.03,
+        distance_ratio: float=0.05,
         min_distance: float=1e-5,
         preserve_root_children: bool=False,
         collapse_single_child: bool=True,
@@ -307,6 +307,10 @@ class Asset():
         link in front of the real limb chain, or a zero-length leaf.  This folds
         those markers away by reparenting descendants to the closest kept
         ancestor and merging their skin weights into that ancestor.
+
+        Iterates until no further joints qualify for collapse, because deleting
+        one set of near-parent joints can reparent descendants and expose
+        additional colocated nodes (chains of near-zero-length bones).
         """
         if self.parents is None or self.matrix_local is None or self.J <= 1:
             return []
@@ -331,35 +335,45 @@ class Asset():
         reference_length = float(np.median(nonzero_lengths))
         threshold = max(min_distance, reference_length * distance_ratio)
 
-        children = [[] for _ in range(self.J)]
-        for i, p in enumerate(parents):
-            if p >= 0:
-                children[int(p)].append(i)
+        all_removed_names: List[str] = []
 
-        to_remove = []
-        for i, p in enumerate(parents):
-            p = int(p)
-            if p < 0:
-                continue
-            if len(children[i]) == 0 and not collapse_leaf:
-                continue
-            if not collapse_single_child and len(children[i]) == 1:
-                continue
-            if preserve_root_children and parents[p] == -1:
-                continue
-            distance = float(np.linalg.norm(joints[i] - joints[p]))
-            if distance <= threshold:
-                to_remove.append(i)
+        while True:
+            joints = self.joints
+            parents = self.parents
+            if joints is None or parents is None or self.J <= 1:
+                break
 
-        if not to_remove:
-            return []
+            children = [[] for _ in range(self.J)]
+            for i, p in enumerate(parents):
+                if p >= 0:
+                    children[int(p)].append(i)
 
-        removed_names = [
-            self.joint_names[i] if self.joint_names is not None else f"bone_{i}"
-            for i in to_remove
-        ]
-        self.delete_joints(to_remove)
-        return removed_names
+            to_remove = []
+            for i, p in enumerate(parents):
+                p = int(p)
+                if p < 0:
+                    continue
+                if len(children[i]) == 0 and not collapse_leaf:
+                    continue
+                if not collapse_single_child and len(children[i]) == 1:
+                    continue
+                if preserve_root_children and parents[p] == -1:
+                    continue
+                distance = float(np.linalg.norm(joints[i] - joints[p]))
+                if distance <= threshold:
+                    to_remove.append(i)
+
+            if not to_remove:
+                break
+
+            removed_names = [
+                self.joint_names[i] if self.joint_names is not None else f"bone_{i}"
+                for i in to_remove
+            ]
+            all_removed_names.extend(removed_names)
+            self.delete_joints(to_remove)
+
+        return all_removed_names
     
     def delete_vertices(self, vertices_to_remove: List[int]|ndarray):
         """
