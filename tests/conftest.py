@@ -1,9 +1,9 @@
 """Shared fixtures for the serve concurrency tests.
 
 These tests exercise the real pipeline orchestration in :mod:`serve` (locks,
-executors, semaphore, cancellation, RNG isolation) while stubbing out the heavy
-stage workers (bpy parse/export, GPU inference, remote renamer) so no model,
-GPU, or Blender runtime is required.
+executors, cancellation, RNG isolation) while stubbing out the heavy stage
+workers (bpy parse/export, GPU inference) so no model, GPU, or Blender
+runtime is required.
 """
 
 import asyncio
@@ -41,7 +41,6 @@ def fresh_state():
     serve.state.gpu_executor = gpu_executor
     serve.state.bpy_lock = asyncio.Lock()
     serve.state.gpu_lock = asyncio.Lock()
-    serve.state.renamer_sem = asyncio.Semaphore(serve.RENAMER_CONCURRENCY)
     serve.state.active_jobs = 0
     serve.state.ready = True
 
@@ -54,8 +53,8 @@ def fresh_state():
 class ResourceTracker:
     """Thread-safe record of how many requests occupy each resource at once.
 
-    The stage workers run on executor threads while the renamer runs on the
-    event loop, so all bookkeeping is guarded by a plain threading lock.
+    All stage workers run on executor threads so all bookkeeping is guarded
+    by a plain threading lock.
     """
 
     def __init__(self):

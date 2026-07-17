@@ -90,16 +90,7 @@ STARTUP_HEARTBEAT_SEC = max(
     1.0, float(os.environ.get("SKINTOKENS_STARTUP_HEARTBEAT_SEC", "15"))
 )
 SUPPORTED_EXT = {".obj", ".fbx", ".glb"}
-SKELETON_RENAMER_URL = os.environ.get(
-    "SKINTOKENS_SKELETON_RENAMER_URL",
-    "http://skeleton-renamer:8088",
-)
-# Max concurrent skeleton-renamer calls. The renamer is a remote network
-# service that touches neither the local GPU nor bpy, so its calls are safe to
-# run in parallel — bounded only to avoid overwhelming the remote service.
-RENAMER_CONCURRENCY = max(
-    1, int(os.environ.get("SKINTOKENS_RENAMER_CONCURRENCY", "4"))
-)
+
 
 
 def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -298,9 +289,6 @@ class ServerState:
     # heartbeat instead of a silent stall (see _acquire_or_cancel).
     bpy_queue: "_PhaseQueue" = _PhaseQueue()
     gpu_queue: "_PhaseQueue" = _PhaseQueue()
-    # Remote renamer calls are independent network I/O — safe to run in parallel.
-    renamer_sem: asyncio.Semaphore = asyncio.Semaphore(RENAMER_CONCURRENCY)
-
     @property
     def busy(self) -> bool:
         return self.active_jobs > 0
@@ -479,7 +467,6 @@ class GenParams(BaseModel):
     num_samples: int = Field(default=DEFAULT_NUM_SAMPLES, ge=1, le=8)
     seed: int | None = None
     use_skeleton: bool = False
-    skip_renamer: bool = False
 
 
 # --------------------------------------------------------------------------- #
@@ -852,8 +839,7 @@ def _export_samples(
 ) -> list[bytes]:
     """Stage 3 (bpy): export each predicted asset to a GLB on disk.
 
-    Runs on the dedicated bpy thread under ``bpy_lock``. Returns the raw GLB
-    bytes per sample; the remote renamer runs afterward outside any lock.
+    Runs on the dedicated bpy thread under ``bpy_lock``.
     """
     from src.rig_package.parser.bpy import transfer_rigging
 
@@ -893,96 +879,6 @@ def _export_samples(
         glbs.append(glb_data)
 
     return glbs
-
-
-async def _run_skeleton_rename_async(
-    glb_data: bytes,
-    file_name: str,
-    conf_thresh: float,
-    request_id: str,
-    cancellation: CancellationToken,
-) -> tuple[bytes, dict]:
-    """Send GLB data to the remote skeleton renamer service via WebSocket and
-    return the renamed GLB bytes.
-
-    Runs natively on the event loop (no nested ``asyncio.run`` / worker thread)
-    and outside the bpy/GPU locks, so multiple renames proceed in parallel —
-    bounded by ``state.renamer_sem``. Each call owns its own WebSocket, so there
-    is no shared state between concurrent renames.
-    """
-    import json as _json
-
-    ws_url = SKELETON_RENAMER_URL.rstrip("/")
-    if ws_url.startswith("https://"):
-        ws_url = "wss://" + ws_url[len("https://"):]
-    elif ws_url.startswith("http://"):
-        ws_url = "ws://" + ws_url[len("http://"):]
-    elif not ws_url.startswith(("ws://", "wss://")):
-        ws_url = "ws://" + ws_url
-    ws_url += "/ws/skeleton-renamer"
-
-    async def _rename():
-        import websockets as _ws
-        payload_dict: dict = {
-            "file_name": file_name,
-            "conf_thresh": conf_thresh,
-        }
-        payload = _json.dumps(payload_dict)
-        async with _ws.connect(
-            ws_url,
-            max_size=64 * 1024 * 1024,
-            open_timeout=30,
-        ) as ws:
-            await ws.send(payload)
-            await ws.send(glb_data)
-            async for raw_message in ws:
-                message = _json.loads(raw_message)
-                stage = message.get("stage", "unknown")
-                if stage == "done":
-                    glb_size = message.get("glb_size", 0)
-                    if not glb_size:
-                        raise RuntimeError("renamer returned done without glb_size")
-                    renamed_bytes = await ws.recv()
-                    if isinstance(renamed_bytes, str):
-                        renamed_bytes = renamed_bytes.encode()
-                    renamer_meta = {k: v for k, v in message.items()
-                                    if k not in ("stage", "glb_size")}
-                    return renamed_bytes, renamer_meta
-                elif stage == "error":
-                    raise RuntimeError(message.get("message", "unknown renamer error"))
-                elif stage == "cancelled":
-                    raise RuntimeError(f"renamer cancelled: {message.get('message', '')}")
-            raise RuntimeError("WebSocket closed before renamer result")
-
-    logger.info("[%s] calling skeleton renamer at %s (file=%s, conf_thresh=%.2f)",
-                request_id, ws_url, file_name, conf_thresh)
-
-    rename_task = asyncio.create_task(_rename())
-    cancel_task = asyncio.create_task(cancellation.wait())
-    try:
-        await asyncio.wait(
-            (rename_task, cancel_task), return_when=asyncio.FIRST_COMPLETED
-        )
-        if cancellation.cancelled:
-            rename_task.cancel()
-            with suppress(asyncio.CancelledError, Exception):
-                await rename_task
-            cancellation.raise_if_cancelled()
-        return rename_task.result()
-    except GenerationCancelled:
-        raise
-    except Exception:
-        logger.error("[%s] skeleton renamer failed", request_id)
-        raise
-    finally:
-        if not rename_task.done():
-            rename_task.cancel()
-            with suppress(asyncio.CancelledError, Exception):
-                await rename_task
-        if not cancel_task.done():
-            cancel_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await cancel_task
 
 
 class ProgressReporter:
@@ -1037,9 +933,8 @@ async def _generate(
     the thread-driven ``progress_callback``).
 
     Returns:
-        List of (glb_bytes, renamer_meta) tuples, one per sample.
-        renamer_meta is a dict of all extra fields from the skeleton-renamer
-        "done" message (e.g. ``species``, ``species_tags``, ``joint_count``).
+        List of (glb_bytes, meta_dict) tuples, one per sample.
+        meta_dict is always empty since the skeleton renamer has been removed.
     """
     cancellation = cancellation or CancellationToken()
     reporter = ProgressReporter(request_id, cancellation, progress_callback)
@@ -1115,10 +1010,8 @@ async def _generate(
             )
         del preds
 
-        # --- Stage 4: skeleton rename (remote, runs in parallel, no lock) ---
-        results = await _run_renamers(
-            glbs, filename, params, request_id, cancellation, reporter
-        )
+        # --- Stage 4: wrap results (no remote renamer) ---
+        results = [(glb, {}) for glb in glbs]
         del glbs
         reporter.report(100, "complete")
         return results
@@ -1128,60 +1021,6 @@ async def _generate(
             shutil.rmtree(tmp_input_dir, ignore_errors=True)
         with suppress(OSError):
             shutil.rmtree(tmp_output_dir, ignore_errors=True)
-
-
-async def _run_renamers(
-    glbs: list[bytes],
-    filename: str,
-    params: GenParams,
-    request_id: str,
-    cancellation: CancellationToken,
-    reporter: "ProgressReporter",
-) -> list[tuple[bytes, dict]]:
-    """Run the remote skeleton renamer for each sample concurrently.
-
-    Each sample is an independent remote call gated by ``state.renamer_sem``;
-    results preserve sample order. With ``skip_renamer`` the GLBs pass through
-    unchanged.
-    """
-    sample_count = max(len(glbs), 1)
-
-    if params.skip_renamer:
-        for sample_idx in range(len(glbs)):
-            logger.info("[%s] sample=%d skipping skeleton renamer",
-                        request_id, sample_idx)
-            _report_sample_progress(
-                reporter.report, sample_count, sample_idx, "complete"
-            )
-        return [(glb, {}) for glb in glbs]
-
-    async def _rename_one(sample_idx: int, glb: bytes) -> tuple[bytes, dict]:
-        async with state.renamer_sem:
-            cancellation.raise_if_cancelled()
-            _report_sample_progress(
-                reporter.report, sample_count, sample_idx, "renaming"
-            )
-            renamed, meta = await _run_skeleton_rename_async(
-                glb, filename, 0.8, request_id, cancellation,
-            )
-            _report_sample_progress(
-                reporter.report, sample_count, sample_idx, "complete"
-            )
-            return renamed, meta
-
-    tasks = [
-        asyncio.create_task(_rename_one(idx, glb))
-        for idx, glb in enumerate(glbs)
-    ]
-    try:
-        return await asyncio.gather(*tasks)
-    except BaseException:
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        with suppress(BaseException):
-            await asyncio.gather(*tasks, return_exceptions=True)
-        raise
 
 
 async def _watch_ws_cancellation(
@@ -1291,7 +1130,6 @@ async def ws_generate(ws: WebSocket):
             await ws.close()
             return
 
-        # Receive optional image for skeleton-renamer
         params = GenParams(
             **{k: v for k, v in req.items() if k in GenParams.model_fields}
         )
@@ -1313,10 +1151,9 @@ async def ws_generate(ws: WebSocket):
                 "progress": percent, "elapsed_sec": elapsed,
                 "request_id": request_id,
             }
-            # Progress is reported both from worker threads (parse/infer/export)
-            # and from the event loop itself (the renamer stage). Blocking on
-            # run_coroutine_threadsafe from the loop thread would deadlock, so
-            # detect that case and schedule the send instead.
+            # Progress is reported from worker threads (parse/infer/export).
+            # Blocking on run_coroutine_threadsafe from the loop thread would
+            # deadlock, so detect that case and schedule the send instead.
             try:
                 running_loop = asyncio.get_running_loop()
             except RuntimeError:
@@ -1393,9 +1230,9 @@ async def ws_generate(ws: WebSocket):
         with suppress(asyncio.CancelledError):
             await receiver_task
 
-        results = await generation_task  # list of (glb, renamer_meta)
+        results = await generation_task  # list of (glb, meta) tuples
 
-        for sample_idx, (glb, renamer_meta) in enumerate(results):
+        for sample_idx, (glb, _meta) in enumerate(results):
             done_msg: dict = {
                 "stage": "done",
                 "sample_index": sample_idx,
@@ -1405,7 +1242,6 @@ async def ws_generate(ws: WebSocket):
                 "request_id": request_id,
                 "glb_size": len(glb),
             }
-            done_msg.update(renamer_meta)
             await ws.send_json(done_msg)
             await ws.send_bytes(glb)
 

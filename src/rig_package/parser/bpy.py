@@ -589,7 +589,7 @@ def make_asset(
     else:
         armature = None
         armature_name = 'Armature'
-        joint_names = asset.joint_names if asset.joint_names is not None else [f"bone_{i}" for i in range(asset.J)]
+        joint_names = asset.joint_names if asset.joint_names is not None else [f"unknown_{i}" for i in range(asset.J)]
     
     if armature is None and asset.joints is not None and asset.parents is not None:
         joints = asset.joints

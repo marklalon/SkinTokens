@@ -367,7 +367,7 @@ class Asset():
                 break
 
             removed_names = [
-                self.joint_names[i] if self.joint_names is not None else f"bone_{i}"
+                self.joint_names[i] if self.joint_names is not None else f"unknown_{i}"
                 for i in to_remove
             ]
             all_removed_names.extend(removed_names)
@@ -828,7 +828,7 @@ class Asset():
             matrix_local[...] = np.eye(4)
             matrix_local[:, :3, 3] = joints
         if joint_names is None and matrix_local is not None:
-            joints_names = [f"bone_{i}" for i in range(matrix_local.shape[0])]
+            joints_names = [f"unknown_{i}" for i in range(matrix_local.shape[0])]
         
         if sampled_vertices is not None and vertices is not None and sampled_skin is not None:
             tree = cKDTree(sampled_vertices)

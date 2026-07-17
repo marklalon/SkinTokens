@@ -88,7 +88,6 @@ async def _run(args) -> None:
         "seed": args.seed,
         "do_sample": True,
         "use_skeleton": args.use_skeleton,
-        "skip_renamer": args.skip_renamer,
     }
 
     progress = ProgressDisplay()
@@ -143,15 +142,6 @@ async def _run(args) -> None:
                         progress.update(100, "complete", message.get("elapsed_sec"))
                         progress.finish()
                         # Binary GLB frame follows the done message
-                        renamer_meta = {k: v for k, v in message.items()
-                                         if k not in ("stage", "glb_size",
-                                                      "elapsed_sec", "progress",
-                                                      "request_id", "sample_index",
-                                                      "num_samples")}
-                        if renamer_meta:
-                            for k, v in renamer_meta.items():
-                                print(f"[client] {k}: {v}")
-                        # Continue loop to receive the binary frame
                         continue
                     elif stage == "cancelled":
                         raise asyncio.CancelledError(message.get("message"))
@@ -192,7 +182,6 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducible generation")
 
     parser.add_argument("--use-skeleton", action="store_true", help="Use skeleton for skin generation")
-    parser.add_argument("--skip-renamer", action="store_true", help="Skip the skeleton renamer step")
 
     parser.add_argument("--timeout", type=int, default=30, help="Connection timeout seconds")
     args = parser.parse_args()

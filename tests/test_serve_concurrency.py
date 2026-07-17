@@ -6,7 +6,6 @@ Covered guarantees:
   * GPU inference is a single-instance critical section  -> one forward at a
     time.
   * bpy and GPU stages of *different* requests overlap   -> real pipelining.
-  * the remote renamer runs in parallel, bounded by the semaphore.
   * results never cross-contaminate between concurrent requests.
   * cancellation unwinds cleanly (locks released, no leaked jobs).
 """
@@ -22,11 +21,11 @@ import serve
 # --------------------------------------------------------------------------- #
 # Fake stage workers
 # --------------------------------------------------------------------------- #
-def install_fake_stages(monkeypatch, tracker, *, stage_sleep=0.05, renamer_sleep=0.05):
+def install_fake_stages(monkeypatch, tracker, *, stage_sleep=0.05):
     """Replace the heavy stage workers with light, instrumented stand-ins.
 
-    Each fake threads the request_id through batch -> preds -> glbs -> renamed
-    bytes so a test can prove every byte of a result belongs to its own request.
+    Each fake threads the request_id through batch -> preds -> glbs so a test
+    can prove every byte of a result belongs to its own request.
     """
 
     def fake_prepare(input_path, params, request_id, cancellation, progress_callback=None):
@@ -56,19 +55,9 @@ def install_fake_stages(monkeypatch, tracker, *, stage_sleep=0.05, renamer_sleep
         finally:
             tracker.exit("bpy", request_id)
 
-    async def fake_rename(glb_data, file_name, conf_thresh, request_id, cancellation):
-        tracker.enter("renamer", request_id)
-        try:
-            await asyncio.sleep(renamer_sleep)
-            cancellation.raise_if_cancelled()
-            return glb_data + b":renamed", {"req": request_id}
-        finally:
-            tracker.exit("renamer", request_id)
-
     monkeypatch.setattr(serve, "_prepare_inputs", fake_prepare)
     monkeypatch.setattr(serve, "_run_inference", fake_infer)
     monkeypatch.setattr(serve, "_export_samples", fake_export)
-    monkeypatch.setattr(serve, "_run_skeleton_rename_async", fake_rename)
 
 
 def make_params(**kw):
@@ -82,7 +71,7 @@ def test_bpy_and_gpu_serialized_and_pipelined(monkeypatch, tracker):
     install_fake_stages(monkeypatch, tracker)
 
     async def scenario():
-        params = make_params(num_samples=1, skip_renamer=True)
+        params = make_params(num_samples=1)
         results = await asyncio.gather(*[
             serve._generate(b"data", "model.obj", params, f"req{i}")
             for i in range(4)
@@ -110,7 +99,7 @@ def test_no_cross_contamination_multi_sample(monkeypatch, tracker):
 
     async def scenario():
         results = {}
-        params = [make_params(num_samples=n, skip_renamer=True) for n in (1, 3, 2)]
+        params = [make_params(num_samples=n) for n in (1, 3, 2)]
 
         async def one(i):
             results[i] = await serve._generate(
@@ -135,7 +124,7 @@ def test_gpu_lock_is_single_instance(monkeypatch, tracker):
     install_fake_stages(monkeypatch, tracker, stage_sleep=0.02)
 
     async def scenario():
-        params = make_params(num_samples=1, skip_renamer=True)
+        params = make_params(num_samples=1)
         await asyncio.gather(*[
             serve._generate(b"d", "m.obj", params, f"r{i}") for i in range(8)
         ])
@@ -144,64 +133,7 @@ def test_gpu_lock_is_single_instance(monkeypatch, tracker):
     assert tracker.max_active["gpu"] == 1
 
 
-# --------------------------------------------------------------------------- #
-# Renamer: bounded parallelism, ordering, passthrough
-# --------------------------------------------------------------------------- #
-def test_renamer_concurrency_bounded_by_semaphore(monkeypatch, tracker):
-    install_fake_stages(monkeypatch, tracker, stage_sleep=0.0, renamer_sleep=0.08)
 
-    async def scenario():
-        serve.state.renamer_sem = asyncio.Semaphore(2)
-        params = make_params(num_samples=5, skip_renamer=False)
-        return await serve._generate(b"d", "m.obj", params, "req")
-
-    samples = asyncio.run(scenario())
-
-    assert len(samples) == 5
-    # The semaphore must cap parallel renames, and they must actually parallelize.
-    assert tracker.max_active["renamer"] <= 2
-    assert tracker.max_active["renamer"] == 2
-    for sample_idx, (glb, meta) in enumerate(samples):
-        assert glb == f"glb:req:{sample_idx}".encode() + b":renamed"
-        assert meta == {"req": "req"}
-
-
-def test_renamer_preserves_sample_order_despite_out_of_order_completion(monkeypatch):
-    """Later samples finishing first must not reorder the results."""
-
-    async def fake_rename(glb_data, file_name, conf_thresh, request_id, cancellation):
-        # idx encoded as the trailing number of the glb payload "glb:req:<idx>"
-        idx = int(glb_data.decode().rsplit(":", 1)[1])
-        # Earlier indices sleep longer, so completion order is reversed.
-        await asyncio.sleep(0.02 * (5 - idx))
-        return glb_data + b":renamed", {"idx": idx}
-
-    monkeypatch.setattr(serve, "_run_skeleton_rename_async", fake_rename)
-
-    async def scenario():
-        serve.state.renamer_sem = asyncio.Semaphore(10)
-        glbs = [f"glb:req:{i}".encode() for i in range(5)]
-        reporter = serve.ProgressReporter("req", serve.CancellationToken(), None)
-        return await serve._run_renamers(
-            glbs, "m.obj", make_params(), "req", serve.CancellationToken(), reporter
-        )
-
-    results = asyncio.run(scenario())
-    assert [meta["idx"] for _, meta in results] == [0, 1, 2, 3, 4]
-
-
-def test_skip_renamer_passthrough(monkeypatch, tracker):
-    install_fake_stages(monkeypatch, tracker)
-
-    async def scenario():
-        params = make_params(num_samples=2, skip_renamer=True)
-        return await serve._generate(b"d", "m.obj", params, "req")
-
-    samples = asyncio.run(scenario())
-    assert tracker.max_active["renamer"] == 0  # renamer never invoked
-    for sample_idx, (glb, meta) in enumerate(samples):
-        assert glb == f"glb:req:{sample_idx}".encode()
-        assert meta == {}
 
 
 # --------------------------------------------------------------------------- #
@@ -212,7 +144,7 @@ def test_cancellation_unwinds_pipeline_and_releases_locks(monkeypatch, tracker):
 
     async def scenario():
         cancellation = serve.CancellationToken()
-        params = make_params(num_samples=1, skip_renamer=True)
+        params = make_params(num_samples=1)
         task = asyncio.create_task(
             serve._generate(b"d", "m.obj", params, "req", None, cancellation)
         )
@@ -226,37 +158,6 @@ def test_cancellation_unwinds_pipeline_and_releases_locks(monkeypatch, tracker):
     assert serve.state.active_jobs == 0
     assert not serve.state.bpy_lock.locked()
     assert not serve.state.gpu_lock.locked()
-
-
-def test_renamer_cancellation_cancels_siblings(monkeypatch):
-    started = []
-    completed = []
-
-    async def fake_rename(glb_data, file_name, conf_thresh, request_id, cancellation):
-        started.append(glb_data)
-        await asyncio.sleep(0.3)
-        cancellation.raise_if_cancelled()
-        completed.append(glb_data)
-        return glb_data, {}
-
-    monkeypatch.setattr(serve, "_run_skeleton_rename_async", fake_rename)
-
-    async def scenario():
-        serve.state.renamer_sem = asyncio.Semaphore(10)
-        cancellation = serve.CancellationToken()
-        glbs = [f"g{i}".encode() for i in range(4)]
-        reporter = serve.ProgressReporter("req", cancellation, None)
-        task = asyncio.create_task(
-            serve._run_renamers(glbs, "m.obj", make_params(), "req", cancellation, reporter)
-        )
-        await asyncio.sleep(0.05)
-        cancellation.cancel("cancel all")
-        with pytest.raises(serve.GenerationCancelled):
-            await task
-
-    asyncio.run(scenario())
-    assert len(started) == 4   # all dispatched in parallel
-    assert completed == []     # none allowed to finish after cancel
 
 
 def test_unsupported_extension_rejected():

@@ -358,7 +358,7 @@ class TokenizerPart(Tokenizer):
         if self.order is not None:
             joint_names = self.order.make_names(cls=cls, parts=parts, num_bones=num_bones)
         else:
-            joint_names = [f"bone_{i}" for i in range(num_bones)]
+            joint_names = [f"unknown_{i}" for i in range(num_bones)]
         return DetokenizeOutput(
             tokens=ids,
             bones=bones,

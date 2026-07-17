@@ -68,7 +68,7 @@ class Order(ConfigSpec):
                 names.extend(self.parts[cls][part])
         assert len(names) <= num_bones, "number of bones in required skeleton is more than existing bones"
         for i in range(len(names), num_bones):
-            names.append(f"bone_{i}")
+            names.append(f"unknown_{i}")
         return names
     
     def arrange_names(self, cls: str|None, names: List[str], parents: List[int], joints: Optional[ndarray]=None) -> Tuple[List[str], Dict[int, str|None]]:
