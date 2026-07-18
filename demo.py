@@ -145,9 +145,10 @@ def run_rig(
 
         asset = preds[0].asset
         assert asset is not None
-        collapsed_joints = asset.collapse_near_parent_joints()
-        if collapsed_joints:
-            print(f"[postprocess] Collapsed near-parent joints: {', '.join(collapsed_joints)}")
+        if not use_skeleton:
+            collapsed_joints = asset.collapse_near_parent_joints()
+            if collapsed_joints:
+                print(f"[postprocess] Collapsed near-parent joints: {', '.join(collapsed_joints)}")
 
         out_path = output_paths[i]
         out_path.parent.mkdir(parents=True, exist_ok=True)

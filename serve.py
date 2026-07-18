@@ -852,14 +852,15 @@ def _export_samples(
 
         asset = pred.asset
         assert asset is not None
-        collapsed_joints = asset.collapse_near_parent_joints()
-        if collapsed_joints:
-            logger.info(
-                "[%s] sample=%d collapsed near-parent skeleton joints: %s",
-                request_id,
-                sample_idx,
-                ", ".join(collapsed_joints),
-            )
+        if not params.use_skeleton:
+            collapsed_joints = asset.collapse_near_parent_joints()
+            if collapsed_joints:
+                logger.info(
+                    "[%s] sample=%d collapsed near-parent skeleton joints: %s",
+                    request_id,
+                    sample_idx,
+                    ", ".join(collapsed_joints),
+                )
 
         sample_out_path = tmp_output_dir / f"sample_{sample_idx}.glb"
         sample_out_path.parent.mkdir(parents=True, exist_ok=True)

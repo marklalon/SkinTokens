@@ -632,6 +632,11 @@ class TokenRig(ModelSpec):
                             f"expected {expected}, got {actual}"
                         )
                     asset: Asset = batch['model_input'][i].asset.copy()
+                    joint_names = res.detokenize_output.joint_names
+                    if skeleton_tokens[i] is not None and asset.joint_names is not None:
+                        num_pred_joints = res.detokenize_output.joints.shape[0]
+                        if len(asset.joint_names) == num_pred_joints:
+                            joint_names = asset.joint_names.copy()
                     res.asset = Asset.from_data(
                         vertices=asset.vertices,
                         faces=asset.faces,
@@ -639,6 +644,7 @@ class TokenRig(ModelSpec):
                         sampled_skin=res.skin_pred.detach().float().cpu().numpy(),
                         joints=res.detokenize_output.joints,
                         parents=np.array(res.detokenize_output.parents),
+                        joint_names=joint_names,
                         cls=asset.cls,
                         path=asset.path,
                     )
