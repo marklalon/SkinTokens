@@ -633,17 +633,35 @@ class TokenRig(ModelSpec):
                         )
                     asset: Asset = batch['model_input'][i].asset.copy()
                     joint_names = res.detokenize_output.joint_names
-                    if skeleton_tokens[i] is not None and asset.joint_names is not None:
-                        num_pred_joints = res.detokenize_output.joints.shape[0]
-                        if len(asset.joint_names) == num_pred_joints:
+                    # Default to the model-decoded skeleton (from the generated
+                    # tokens, quantized to the tokenizer's discretization grid).
+                    pred_joints = res.detokenize_output.joints
+                    pred_parents = np.array(res.detokenize_output.parents)
+                    num_pred_joints = res.detokenize_output.joints.shape[0]
+                    if skeleton_tokens[i] is not None:
+                        # A skeleton was supplied (use_skeleton): the decoded
+                        # joints are only a lossy quantized round-trip of the
+                        # input skeleton, so their positions (root height
+                        # included) drift by up to half a discretization step.
+                        # Restore the exact input joints/parents so the skeleton
+                        # is preserved bit-for-bit and only the skin is
+                        # generated. Both live in the same normalized frame as
+                        # ``sampled_vertices`` (the same similarity transform was
+                        # applied to vertices and joints), so downstream
+                        # transfer_rigging maps them back to the source pose.
+                        if asset.joint_names is not None and len(asset.joint_names) == num_pred_joints:
                             joint_names = asset.joint_names.copy()
+                        if asset.joints is not None and asset.joints.shape[0] == num_pred_joints:
+                            pred_joints = asset.joints.copy()
+                            if asset.parents is not None:
+                                pred_parents = np.array(asset.parents)
                     res.asset = Asset.from_data(
                         vertices=asset.vertices,
                         faces=asset.faces,
                         sampled_vertices=vertices[i].detach().float().cpu().numpy(),
                         sampled_skin=res.skin_pred.detach().float().cpu().numpy(),
-                        joints=res.detokenize_output.joints,
-                        parents=np.array(res.detokenize_output.parents),
+                        joints=pred_joints,
+                        parents=pred_parents,
                         joint_names=joint_names,
                         cls=asset.cls,
                         path=asset.path,

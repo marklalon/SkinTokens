@@ -871,7 +871,12 @@ def _export_samples(
                 target_path=asset.path,
                 export_path=str(sample_out_path),
                 group_per_vertex=4,
-                auto_ground=True,
+                # auto_ground shifts the whole scene so its bottom sits at Z=0,
+                # which moves the skeleton root height. When a skeleton was
+                # supplied (use_skeleton), the output must sit exactly where the
+                # input skeleton was, so grounding is disabled and only skinning
+                # is applied.
+                auto_ground=not params.use_skeleton,
             )
 
         glb_data = sample_out_path.read_bytes()
